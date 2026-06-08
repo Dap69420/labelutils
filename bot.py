@@ -45,6 +45,11 @@ POOL_DATABASE_URLS = {
     )
     if url
 }
+POOL_DATABASE_NAMES = {
+    1: "West US",
+    2: "Europe (UK)",
+    3: "South-East Asia",
+}
 OWNER_USER_IDS = {
     int(value.strip())
     for value in os.getenv("OWNER_USER_IDS", "").split(",")
@@ -70,10 +75,17 @@ except ValueError:
 PANEL_PAGE_SIZE = 4
 LEADERBOARD_PAGE_SIZE = 10
 class StorageContext:
-    def __init__(self, database_url: str, schema_name: str | None = None, storage_mode: str = "custom"):
+    def __init__(
+        self,
+        database_url: str,
+        schema_name: str | None = None,
+        storage_mode: str = "custom",
+        pool_slot: int | None = None,
+    ):
         self.database_url = database_url
         self.schema_name = schema_name
         self.storage_mode = storage_mode
+        self.pool_slot = pool_slot
 
     def __bool__(self) -> bool:
         return bool(self.database_url)
@@ -502,10 +514,16 @@ def available_pool_slots() -> list[int]:
     return [slot for slot in sorted(POOL_DATABASE_URLS) if is_valid_database_url(POOL_DATABASE_URLS[slot])]
 
 
-def choose_pool_slot() -> int | None:
+def pool_region_name(pool_slot: int | None) -> str:
+    return POOL_DATABASE_NAMES.get(int(pool_slot or 0), "Unknown")
+
+
+def choose_pool_slot(*, randomize: bool = False) -> int | None:
     slots = available_pool_slots()
     if not slots:
         return None
+    if randomize:
+        return random.choice(slots)
 
     usage = {slot: 0 for slot in slots}
     if DATABASE_URL:
@@ -529,14 +547,24 @@ def choose_pool_slot() -> int | None:
     return min(slots, key=lambda slot: (usage[slot], slot))
 
 
-def assign_pooled_guild_database(guild_id: int, configured_by: int, label_name: str) -> bool:
+def assign_pooled_guild_database(
+    guild_id: int,
+    configured_by: int,
+    label_name: str,
+    pool_slot: int | None = None,
+    *,
+    randomize: bool = False,
+) -> bool:
     if not DATABASE_URL:
         logger.warning("DATABASE_URL is missing; cannot store pooled database settings.")
         return False
 
-    pool_slot = choose_pool_slot()
+    pool_slot = pool_slot or choose_pool_slot(randomize=randomize)
     if not pool_slot:
         logger.warning("No POOL_DATABASE_URL_1..3 values are configured.")
+        return False
+    if pool_slot not in POOL_DATABASE_URLS or not is_valid_database_url(POOL_DATABASE_URLS[pool_slot]):
+        logger.warning("Requested pool slot %s is not configured.", pool_slot)
         return False
 
     schema_name = guild_schema_name(guild_id)
@@ -568,6 +596,7 @@ def assign_pooled_guild_database(guild_id: int, configured_by: int, label_name: 
             POOL_DATABASE_URLS[pool_slot],
             schema_name=schema_name,
             storage_mode="pooled",
+            pool_slot=pool_slot,
         )
         guild_brand_cache.pop(guild_id, None)
         guild_pro_settings_cache.pop(guild_id, None)
@@ -641,6 +670,7 @@ def get_guild_database_url(guild_id: int | None) -> StorageContext | None:
                 POOL_DATABASE_URLS[int(pool_slot)],
                 schema_name=table_schema if valid_schema_name(table_schema) else guild_schema_name(guild_id),
                 storage_mode="pooled",
+                pool_slot=int(pool_slot),
             )
         elif encrypted_database_url:
             custom_url = decrypt_database_url(encrypted_database_url)
@@ -2670,6 +2700,12 @@ class DatabaseSetupModal(discord.ui.Modal, title="Set Server Database"):
                 ephemeral=True,
             )
             return
+        if not guild_has_premium(interaction.guild_id):
+            await interaction.response.send_message(
+                "Custom Neon databases are a Pro feature. Free servers can use `/start` for managed storage.",
+                ephemeral=True,
+            )
+            return
         if not DATABASE_URL:
             await interaction.response.send_message(
                 "The bot owner has not configured the control DATABASE_URL.",
@@ -2910,7 +2946,7 @@ async def help_command(interaction: discord.Interaction):
             "`/queue`, `/recent`, `/panel` - browse submissions\n"
             "`/status` - update a ticket\n"
             "`/start`, `/setup_staff`, `/setup` - setup\n"
-            "`/setup_db` - advanced custom Neon database"
+            "`/storage`, `/setup_db` - Pro storage options"
         ),
         inline=False,
     )
@@ -2920,6 +2956,7 @@ async def help_command(interaction: discord.Interaction):
             "`/premium` and `/redeem` - upgrade this server\n"
             "`/brand`, `/templates`, `/limits`, `/routing` - customize workflows\n"
             "`/shortlist`, `/priority`, `/rate`, `/reasons`, `/digest` - A&R tools\n"
+            "`/storage` - choose West US, Europe (UK), or South-East Asia storage\n"
             "`/ticket_panel`, `/tickets`, `/ticket_set` - support tickets"
         ),
         inline=False,
@@ -3034,7 +3071,12 @@ async def start(interaction: discord.Interaction, label_name: str):
         return
 
     await interaction.response.defer(ephemeral=True)
-    assigned = assign_pooled_guild_database(interaction.guild_id, interaction.user.id, label_name)
+    assigned = assign_pooled_guild_database(
+        interaction.guild_id,
+        interaction.user.id,
+        label_name,
+        randomize=True,
+    )
     if not assigned:
         await interaction.followup.send(
             "I could not assign managed storage. Ask the bot owner to configure `POOL_DATABASE_URL_1` to `POOL_DATABASE_URL_3`, or use `/setup_db`.",
@@ -3044,7 +3086,7 @@ async def start(interaction: discord.Interaction, label_name: str):
 
     context = get_guild_database_url(interaction.guild_id)
     storage_text = (
-        f"managed pool `{context.storage_mode}` schema `{context.schema_name}`"
+        f"managed {pool_region_name(context.pool_slot)} storage schema `{context.schema_name}`"
         if context and context.schema_name
         else "managed storage"
     )
@@ -3055,12 +3097,50 @@ async def start(interaction: discord.Interaction, label_name: str):
     )
 
 
+@tree.command(name="storage", description="Pro admin: choose managed storage region")
+@app_commands.describe(region="Managed storage region")
+@app_commands.choices(
+    region=[
+        app_commands.Choice(name="West US", value=1),
+        app_commands.Choice(name="Europe (UK)", value=2),
+        app_commands.Choice(name="South-East Asia", value=3),
+    ]
+)
+async def storage(interaction: discord.Interaction, region: app_commands.Choice[int]):
+    logger.info("Received /storage from guild=%s user=%s region=%s.", interaction.guild_id, interaction.user.id, region.value)
+    error = require_pro_admin(interaction)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+
+    label_name = interaction.guild.name if interaction.guild else f"Guild {interaction.guild_id}"
+    await interaction.response.defer(ephemeral=True)
+    assigned = assign_pooled_guild_database(
+        interaction.guild_id,
+        interaction.user.id,
+        label_name,
+        pool_slot=region.value,
+    )
+    await interaction.followup.send(
+        f"Managed storage moved to **{pool_region_name(region.value)}**."
+        if assigned
+        else f"I could not assign **{pool_region_name(region.value)}**. Check that `POOL_DATABASE_URL_{region.value}` is configured.",
+        ephemeral=True,
+    )
+
+
 @tree.command(name="setup_db", description="Admin: connect this server to a Neon database")
 async def setup_database(interaction: discord.Interaction):
     logger.info("Received /setup_database from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
     if not user_is_admin(interaction):
         await interaction.response.send_message(
             "Only administrators can configure the server database.",
+            ephemeral=True,
+        )
+        return
+    if not guild_has_premium(interaction.guild_id):
+        await interaction.response.send_message(
+            "Custom Neon databases are a Pro feature. Free servers should use `/start`.",
             ephemeral=True,
         )
         return
@@ -3175,7 +3255,7 @@ async def setup_status(interaction: discord.Interaction):
     control_status = "Configured" if DATABASE_URL else "Missing"
     encryption_status = "Configured" if encryption_ready() else "Missing or invalid"
     if database_url and database_url.schema_name:
-        database_status_text = f"Managed pool schema `{database_url.schema_name}`"
+        database_status_text = f"Managed {pool_region_name(database_url.pool_slot)} schema `{database_url.schema_name}`"
     elif database_url:
         database_status_text = "Custom database connected"
     else:
@@ -3210,7 +3290,7 @@ async def setup_status(interaction: discord.Interaction):
     embed.add_field(name="Branding", value=brand_status, inline=False)
     embed.add_field(name="Staff Channel", value=staff_status, inline=False)
     embed.add_field(name="Submission Threads", value=thread_status, inline=False)
-    embed.set_footer(text="Run /start and /setup_staff to complete setup. /setup_db is optional advanced setup.")
+    embed.set_footer(text="Run /start and /setup_staff to complete setup. Pro can use /storage or /setup_db.")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 

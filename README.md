@@ -16,7 +16,9 @@ Add these runtime secrets/environment variables:
 
 - `DISCORD_BOT_TOKEN`
 - `DATABASE_URL` bot-owner control database for encrypted server database URLs, staff channel IDs, and manual premium grants
-- `POOL_DATABASE_URL_1`, `POOL_DATABASE_URL_2`, `POOL_DATABASE_URL_3` optional managed storage databases assigned automatically by `/start`
+- `POOL_DATABASE_URL_1` managed storage database for West US
+- `POOL_DATABASE_URL_2` managed storage database for Europe (UK)
+- `POOL_DATABASE_URL_3` managed storage database for South-East Asia
 - `CONFIG_ENCRYPTION_KEY` Fernet key used to encrypt server database URLs
 - `DISCORD_GUILD_ID` strongly recommended while testing so slash-command changes appear immediately in that server
 - `STAFF_CHANNEL_ID` optional fallback staff channel for single-server installs
@@ -36,10 +38,11 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 
 After the bot is running, a server administrator should run:
 
-- `/start` to automatically assign this server to one of the managed pooled databases. LabelUtils creates a private PostgreSQL schema like `guild_123456789` and prepares that server's submissions, tickets, branding, and Pro settings tables inside it.
+- `/start` to automatically assign this server to a random managed pooled database. LabelUtils creates a private PostgreSQL schema like `guild_123456789` and prepares that server's submissions, tickets, branding, and Pro settings tables inside it.
 - `/setup_staff` to choose where new submissions and tickets are sent for that server.
 - `/setup` to verify the server database, staff channel, and required bot-owner config.
-- `/setup_db` is optional advanced setup for servers that want to bring their own Neon PostgreSQL URL instead of using managed pooled storage.
+- `/storage` is a Pro command for choosing West US, Europe (UK), or South-East Asia managed storage.
+- `/setup_db` is optional Pro advanced setup for servers that want to bring their own Neon PostgreSQL URL instead of using managed pooled storage.
 
 Users can run `/help` for the command list, `/submission` to check one label submission, `/my_subs` or `/my_demos` to see their own ticket history, and `/my_stats` to see submitted/accepted counts. `/leaderboard` shows a paginated leaderboard of Discord submitters with the most accepted demos. New submissions are checked for duplicate demo links and each staff submission card opens a staff discussion thread when the bot has thread permissions.
 
@@ -54,6 +57,7 @@ Premium is manually managed through the control database:
 - `/brand` opens a form where Pro servers customize the display name, embed color, and submit panel caption used in supported server-specific messages.
 - `/brand_info` shows the active brand settings.
 - `/brand_clear` resets branding to server defaults.
+- `/storage` lets Pro servers choose West US, Europe (UK), or South-East Asia managed storage.
 - `/form` customizes the optional submission prompt.
 - `/templates` opens a form for approval/rejection DMs. Either field can be left blank to keep the current template.
 - `/limits` configures cooldowns, submission caps, and duplicate-link policy.
