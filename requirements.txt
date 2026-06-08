@@ -1,0 +1,4 @@
+discord.py==2.7.1
+cryptography==45.0.7
+psycopg[binary]
+python-dotenv==1.2.2
