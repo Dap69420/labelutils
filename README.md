@@ -16,6 +16,7 @@ Add these runtime secrets/environment variables:
 
 - `DISCORD_BOT_TOKEN`
 - `DATABASE_URL` bot-owner control database for encrypted server database URLs, staff channel IDs, and manual premium grants
+- `POOL_DATABASE_URL_1`, `POOL_DATABASE_URL_2`, `POOL_DATABASE_URL_3` optional managed storage databases assigned automatically by `/start`
 - `CONFIG_ENCRYPTION_KEY` Fernet key used to encrypt server database URLs
 - `DISCORD_GUILD_ID` strongly recommended while testing so slash-command changes appear immediately in that server
 - `STAFF_CHANNEL_ID` optional fallback staff channel for single-server installs
@@ -35,9 +36,10 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 
 After the bot is running, a server administrator should run:
 
-- `/setup_db` to paste that server's Neon PostgreSQL URL. LabelUtils tests the connection, creates the submissions, tickets, branding, and Pro settings tables if needed, then stores the URL encrypted in the bot-owner control database.
+- `/start` to automatically assign this server to one of the managed pooled databases. LabelUtils creates a private PostgreSQL schema like `guild_123456789` and prepares that server's submissions, tickets, branding, and Pro settings tables inside it.
 - `/setup_staff` to choose where new submissions and tickets are sent for that server.
 - `/setup` to verify the server database, staff channel, and required bot-owner config.
+- `/setup_db` is optional advanced setup for servers that want to bring their own Neon PostgreSQL URL instead of using managed pooled storage.
 
 Users can run `/help` for the command list, `/submission` to check one label submission, `/my_subs` or `/my_demos` to see their own ticket history, and `/my_stats` to see submitted/accepted counts. `/leaderboard` shows a paginated leaderboard of Discord submitters with the most accepted demos. New submissions are checked for duplicate demo links and each staff submission card opens a staff discussion thread when the bot has thread permissions.
 
@@ -68,7 +70,7 @@ Premium is manually managed through the control database:
 - `/export` exports a CSV.
 - Artist replies to staff DMs are forwarded into the submission's staff thread. Attachments are forwarded as Discord attachment links, so the bot does not download/reupload files into memory.
 
-Each server's submissions, Pro branding, and Pro settings are stored in that server's configured Neon database. The owner control database only stores the encrypted server database link, staff-channel setup, and premium status.
+Each server's submissions, support tickets, Pro branding, and Pro settings are stored either in its managed pooled schema or in its custom configured Neon database. The owner control database stores pool assignment, encrypted custom database links, staff-channel setup, and premium status.
 
 Submission threads also receive release logs for submission creation, approval, rejection, and staff DM actions.
 Visible submission and premium dates use Discord native timestamps, so Discord renders them in each user's local timezone.

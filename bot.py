@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 
 import discord
 import psycopg
+from psycopg import sql
 from cryptography.fernet import Fernet, InvalidToken
 from discord import app_commands
 from dotenv import load_dotenv
@@ -32,6 +33,18 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 CONFIG_ENCRYPTION_KEY = os.getenv("CONFIG_ENCRYPTION_KEY")
 CLEAR_GLOBAL_COMMANDS = os.getenv("CLEAR_GLOBAL_COMMANDS", "1").lower() not in {"0", "false", "no"}
 PREMIUM_CONTACT = os.getenv("PREMIUM_CONTACT", "Contact the bot owner to buy premium.")
+POOL_DATABASE_URLS = {
+    index: url
+    for index, url in enumerate(
+        [
+            os.getenv("POOL_DATABASE_URL_1"),
+            os.getenv("POOL_DATABASE_URL_2"),
+            os.getenv("POOL_DATABASE_URL_3"),
+        ],
+        start=1,
+    )
+    if url
+}
 OWNER_USER_IDS = {
     int(value.strip())
     for value in os.getenv("OWNER_USER_IDS", "").split(",")
@@ -56,8 +69,18 @@ except ValueError:
     HEALTH_PORT = 7860
 PANEL_PAGE_SIZE = 4
 LEADERBOARD_PAGE_SIZE = 10
+class StorageContext:
+    def __init__(self, database_url: str, schema_name: str | None = None, storage_mode: str = "custom"):
+        self.database_url = database_url
+        self.schema_name = schema_name
+        self.storage_mode = storage_mode
+
+    def __bool__(self) -> bool:
+        return bool(self.database_url)
+
+
 submission_cooldowns: dict[int, datetime] = {}
-guild_database_cache: dict[int, str | None] = {}
+guild_database_cache: dict[int, StorageContext | None] = {}
 guild_staff_channel_cache: dict[int, int] = {}
 guild_brand_cache: dict[int, dict[str, object] | None] = {}
 guild_pro_settings_cache: dict[int, dict[str, object]] = {}
@@ -195,6 +218,16 @@ def normalize_coupon_code(value: str) -> str:
     return "".join(ch for ch in cleaned if ch.isalnum() or ch == "-")
 
 
+def guild_schema_name(guild_id: int) -> str:
+    return f"guild_{guild_id}"
+
+
+def valid_schema_name(value: str | None) -> bool:
+    if not value:
+        return False
+    return value.startswith("guild_") and value[6:].isdigit()
+
+
 def parse_hex_color(value: str) -> int | None:
     cleaned = value.strip().lstrip("#")
     if len(cleaned) != 6:
@@ -255,8 +288,22 @@ def decrypt_database_url(encrypted_database_url: str) -> str | None:
         return None
 
 
-def connect_db(database_url: str):
-    return psycopg.connect(database_url, connect_timeout=DB_TIMEOUT_SECONDS)
+def storage_url(database_url: str | StorageContext) -> str:
+    return database_url.database_url if isinstance(database_url, StorageContext) else database_url
+
+
+def connect_db(database_url: str | StorageContext):
+    conn = psycopg.connect(storage_url(database_url), connect_timeout=DB_TIMEOUT_SECONDS)
+    if isinstance(database_url, StorageContext) and database_url.schema_name:
+        if not valid_schema_name(database_url.schema_name):
+            raise RuntimeError("Refusing to use an invalid guild schema name.")
+        conn.execute(
+            sql.SQL("CREATE SCHEMA IF NOT EXISTS {};").format(sql.Identifier(database_url.schema_name))
+        )
+        conn.execute(
+            sql.SQL("SET search_path TO {}, public;").format(sql.Identifier(database_url.schema_name))
+        )
+    return conn
 
 
 def prefer_ipv4_dns() -> None:
@@ -283,6 +330,10 @@ def ensure_control_tables() -> None:
                     CREATE TABLE IF NOT EXISTS labelutils_guild_databases (
                         guild_id BIGINT PRIMARY KEY,
                         database_url_encrypted TEXT,
+                        storage_mode TEXT NOT NULL DEFAULT 'custom',
+                        pool_slot INTEGER,
+                        table_schema TEXT,
+                        label_name TEXT,
                         staff_channel_id BIGINT,
                         configured_by BIGINT,
                         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -300,6 +351,15 @@ def ensure_control_tables() -> None:
                     """
                     ALTER TABLE labelutils_guild_databases
                     ADD COLUMN IF NOT EXISTS staff_channel_id BIGINT;
+                    """
+                )
+                cur.execute(
+                    """
+                    ALTER TABLE labelutils_guild_databases
+                    ADD COLUMN IF NOT EXISTS storage_mode TEXT NOT NULL DEFAULT 'custom',
+                    ADD COLUMN IF NOT EXISTS pool_slot INTEGER,
+                    ADD COLUMN IF NOT EXISTS table_schema TEXT,
+                    ADD COLUMN IF NOT EXISTS label_name TEXT;
                     """
                 )
                 cur.execute(
@@ -413,24 +473,107 @@ def set_guild_database_url(guild_id: int, configured_by: int, database_url: str)
                 cur.execute(
                     """
                     INSERT INTO labelutils_guild_databases (
-                        guild_id, database_url_encrypted, configured_by, updated_at
+                        guild_id, database_url_encrypted, storage_mode, pool_slot,
+                        table_schema, configured_by, updated_at
                     ) VALUES (
-                        %s, %s, %s, NOW()
+                        %s, %s, 'custom', NULL, NULL, %s, NOW()
                     )
                     ON CONFLICT (guild_id)
                     DO UPDATE SET
                         database_url_encrypted = EXCLUDED.database_url_encrypted,
+                        storage_mode = 'custom',
+                        pool_slot = NULL,
+                        table_schema = NULL,
                         configured_by = EXCLUDED.configured_by,
                         updated_at = NOW();
                     """,
                     (guild_id, encrypted_database_url, configured_by),
                 )
-        guild_database_cache[guild_id] = database_url
+        guild_database_cache[guild_id] = StorageContext(database_url)
         guild_brand_cache.pop(guild_id, None)
         guild_pro_settings_cache.pop(guild_id, None)
         return True
     except Exception:
         logger.exception("Failed to save guild database URL for %s.", guild_id)
+        return False
+
+
+def available_pool_slots() -> list[int]:
+    return [slot for slot in sorted(POOL_DATABASE_URLS) if is_valid_database_url(POOL_DATABASE_URLS[slot])]
+
+
+def choose_pool_slot() -> int | None:
+    slots = available_pool_slots()
+    if not slots:
+        return None
+
+    usage = {slot: 0 for slot in slots}
+    if DATABASE_URL:
+        try:
+            with connect_db(DATABASE_URL) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT pool_slot, COUNT(*)
+                        FROM labelutils_guild_databases
+                        WHERE storage_mode = 'pooled' AND pool_slot IS NOT NULL
+                        GROUP BY pool_slot;
+                        """
+                    )
+                    for pool_slot, count in cur.fetchall():
+                        if pool_slot in usage:
+                            usage[int(pool_slot)] = int(count or 0)
+        except Exception:
+            logger.exception("Failed to calculate pooled database usage.")
+
+    return min(slots, key=lambda slot: (usage[slot], slot))
+
+
+def assign_pooled_guild_database(guild_id: int, configured_by: int, label_name: str) -> bool:
+    if not DATABASE_URL:
+        logger.warning("DATABASE_URL is missing; cannot store pooled database settings.")
+        return False
+
+    pool_slot = choose_pool_slot()
+    if not pool_slot:
+        logger.warning("No POOL_DATABASE_URL_1..3 values are configured.")
+        return False
+
+    schema_name = guild_schema_name(guild_id)
+    safe_label_name = truncate_text(label_name.strip() or f"Guild {guild_id}", 120)
+    try:
+        with connect_db(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO labelutils_guild_databases (
+                        guild_id, database_url_encrypted, storage_mode, pool_slot,
+                        table_schema, label_name, configured_by, updated_at
+                    ) VALUES (
+                        %s, NULL, 'pooled', %s, %s, %s, %s, NOW()
+                    )
+                    ON CONFLICT (guild_id)
+                    DO UPDATE SET
+                        database_url_encrypted = NULL,
+                        storage_mode = 'pooled',
+                        pool_slot = EXCLUDED.pool_slot,
+                        table_schema = EXCLUDED.table_schema,
+                        label_name = EXCLUDED.label_name,
+                        configured_by = EXCLUDED.configured_by,
+                        updated_at = NOW();
+                    """,
+                    (guild_id, pool_slot, schema_name, safe_label_name, configured_by),
+                )
+        guild_database_cache[guild_id] = StorageContext(
+            POOL_DATABASE_URLS[pool_slot],
+            schema_name=schema_name,
+            storage_mode="pooled",
+        )
+        guild_brand_cache.pop(guild_id, None)
+        guild_pro_settings_cache.pop(guild_id, None)
+        return ensure_submission_table(guild_database_cache[guild_id])
+    except Exception:
+        logger.exception("Failed to assign pooled database for guild %s.", guild_id)
         return False
 
 
@@ -464,7 +607,7 @@ def set_guild_staff_channel_id(guild_id: int, configured_by: int, channel_id: in
         return False
 
 
-def get_guild_database_url(guild_id: int | None) -> str | None:
+def get_guild_database_url(guild_id: int | None) -> StorageContext | None:
     if not guild_id:
         return None
     if guild_id in guild_database_cache:
@@ -478,7 +621,7 @@ def get_guild_database_url(guild_id: int | None) -> str | None:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT database_url_encrypted
+                    SELECT database_url_encrypted, storage_mode, pool_slot, table_schema
                     FROM labelutils_guild_databases
                     WHERE guild_id = %s;
                     """,
@@ -490,9 +633,21 @@ def get_guild_database_url(guild_id: int | None) -> str | None:
         guild_database_cache[guild_id] = None
         return None
 
-    database_url = decrypt_database_url(row[0]) if row else None
-    guild_database_cache[guild_id] = database_url
-    return database_url
+    database_context = None
+    if row:
+        encrypted_database_url, storage_mode, pool_slot, table_schema = row
+        if storage_mode == "pooled" and pool_slot in POOL_DATABASE_URLS:
+            database_context = StorageContext(
+                POOL_DATABASE_URLS[int(pool_slot)],
+                schema_name=table_schema if valid_schema_name(table_schema) else guild_schema_name(guild_id),
+                storage_mode="pooled",
+            )
+        elif encrypted_database_url:
+            custom_url = decrypt_database_url(encrypted_database_url)
+            database_context = StorageContext(custom_url) if custom_url else None
+
+    guild_database_cache[guild_id] = database_context
+    return database_context
 
 
 def database_configured_for_guild(guild_id: int | None) -> bool:
@@ -2596,7 +2751,7 @@ class AdvancedSubmissionModal(discord.ui.Modal, title="New Label Submission"):
         database_url = get_guild_database_url(interaction.guild_id)
         if not database_url:
             await interaction.response.send_message(
-                "This server has not connected a Neon database yet. Ask an admin to run `/setup_db`.",
+                "This server has not completed storage setup yet. Ask an admin to run `/start`, or `/setup_db` for a custom Neon database.",
                 ephemeral=True,
             )
             return
@@ -2754,7 +2909,8 @@ async def help_command(interaction: discord.Interaction):
         value=(
             "`/queue`, `/recent`, `/panel` - browse submissions\n"
             "`/status` - update a ticket\n"
-            "`/setup_db`, `/setup_staff`, `/setup` - setup"
+            "`/start`, `/setup_staff`, `/setup` - setup\n"
+            "`/setup_db` - advanced custom Neon database"
         ),
         inline=False,
     )
@@ -2866,6 +3022,39 @@ def require_pro_admin(interaction: discord.Interaction) -> str | None:
     return None
 
 
+@tree.command(name="start", description="Admin: auto-setup this server with LabelUtils managed storage")
+@app_commands.describe(label_name="Display name for this label or server")
+async def start(interaction: discord.Interaction, label_name: str):
+    logger.info("Received /start from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    if not interaction.guild_id:
+        await interaction.response.send_message("Setup must be run inside a server.", ephemeral=True)
+        return
+    if not user_is_admin(interaction):
+        await interaction.response.send_message("Only administrators can set up this server.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    assigned = assign_pooled_guild_database(interaction.guild_id, interaction.user.id, label_name)
+    if not assigned:
+        await interaction.followup.send(
+            "I could not assign managed storage. Ask the bot owner to configure `POOL_DATABASE_URL_1` to `POOL_DATABASE_URL_3`, or use `/setup_db`.",
+            ephemeral=True,
+        )
+        return
+
+    context = get_guild_database_url(interaction.guild_id)
+    storage_text = (
+        f"managed pool `{context.storage_mode}` schema `{context.schema_name}`"
+        if context and context.schema_name
+        else "managed storage"
+    )
+    await interaction.followup.send(
+        f"LabelUtils storage is ready for **{truncate_text(label_name, 120)}** using {storage_text}.\n"
+        "Next: run `/setup_staff` to choose the staff channel.",
+        ephemeral=True,
+    )
+
+
 @tree.command(name="setup_db", description="Admin: connect this server to a Neon database")
 async def setup_database(interaction: discord.Interaction):
     logger.info("Received /setup_database from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
@@ -2931,7 +3120,7 @@ async def database_status(interaction: discord.Interaction):
     text = (
         "This server has a Neon database connected."
         if configured
-        else "No Neon database is connected for this server. Run `/setup_db`."
+        else "No storage is connected for this server. Run `/start`, or `/setup_db` for a custom Neon database."
     )
     await interaction.followup.send(text, ephemeral=True)
 
@@ -2985,7 +3174,12 @@ async def setup_status(interaction: discord.Interaction):
 
     control_status = "Configured" if DATABASE_URL else "Missing"
     encryption_status = "Configured" if encryption_ready() else "Missing or invalid"
-    database_status_text = "Connected" if database_url else "Not connected"
+    if database_url and database_url.schema_name:
+        database_status_text = f"Managed pool schema `{database_url.schema_name}`"
+    elif database_url:
+        database_status_text = "Custom database connected"
+    else:
+        database_status_text = "Not connected"
     premium = get_premium_guild(interaction.guild_id)
     premium_status = f"{premium[0]} until {discord_timestamp(premium[1])}" if premium else "Not active"
     brand = get_guild_brand(interaction.guild_id)
@@ -3016,7 +3210,7 @@ async def setup_status(interaction: discord.Interaction):
     embed.add_field(name="Branding", value=brand_status, inline=False)
     embed.add_field(name="Staff Channel", value=staff_status, inline=False)
     embed.add_field(name="Submission Threads", value=thread_status, inline=False)
-    embed.set_footer(text="Run /setup_db and /setup_staff to complete setup.")
+    embed.set_footer(text="Run /start and /setup_staff to complete setup. /setup_db is optional advanced setup.")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -4210,6 +4404,8 @@ def validate_startup_environment() -> bool:
         ok = False
     if not DATABASE_URL:
         logger.warning("DATABASE_URL is missing. Per-server database setup will fail.")
+    if not available_pool_slots():
+        logger.warning("POOL_DATABASE_URL_1..3 are missing. /start managed storage will fail; /setup_db can still be used.")
     if not CONFIG_ENCRYPTION_KEY:
         logger.warning("CONFIG_ENCRYPTION_KEY is missing. Per-server database setup will fail.")
     if not intents.message_content:
