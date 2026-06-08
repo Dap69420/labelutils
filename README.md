@@ -45,6 +45,11 @@ Premium is manually managed through the control database:
 - `/premium_status` checks the current server's premium state.
 - `/premium_add` grants premium to a server. Owner-only via `OWNER_USER_IDS`.
 - `/premium_remove` removes premium from a server. Owner-only via `OWNER_USER_IDS`.
+- `/setup_brand` lets Pro servers customize the display name, embed color, and tagline used in supported server-specific messages.
+- `/brand_status` shows the active brand settings.
+- `/brand_reset` resets branding to server defaults.
+
+Discord does not support changing a bot's actual avatar or online presence separately per server. Pro branding is server-specific inside LabelUtils messages and embeds.
 
 The app exposes a small health endpoint on `/` and `/health` while the Discord bot runs in the same process.
 

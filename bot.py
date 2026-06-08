@@ -57,6 +57,7 @@ LEADERBOARD_PAGE_SIZE = 10
 submission_cooldowns: dict[int, datetime] = {}
 guild_database_cache: dict[int, str | None] = {}
 guild_staff_channel_cache: dict[int, int] = {}
+guild_brand_cache: dict[int, dict[str, object] | None] = {}
 
 
 SUBMISSIONS_TABLE_SQL = """
@@ -112,6 +113,16 @@ def parse_snowflake(value: str) -> int | None:
     if not cleaned.isdigit():
         return None
     return int(cleaned)
+
+
+def parse_hex_color(value: str) -> int | None:
+    cleaned = value.strip().lstrip("#")
+    if len(cleaned) != 6:
+        return None
+    try:
+        return int(cleaned, 16)
+    except ValueError:
+        return None
 
 
 def encryption_ready() -> bool:
@@ -196,6 +207,18 @@ def ensure_control_tables() -> None:
                         plan TEXT NOT NULL,
                         expires_at TIMESTAMPTZ NOT NULL,
                         added_by BIGINT NOT NULL,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS labelutils_guild_branding (
+                        guild_id BIGINT PRIMARY KEY,
+                        display_name TEXT,
+                        tagline TEXT,
+                        embed_color INTEGER,
+                        updated_by BIGINT NOT NULL,
                         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     );
                     """
@@ -444,6 +467,101 @@ def remove_premium_guild(guild_id: int) -> bool:
                 return cur.rowcount > 0
     except Exception:
         logger.exception("Failed to remove premium for guild %s.", guild_id)
+        return False
+
+
+def get_guild_brand(guild_id: int | None) -> dict[str, object] | None:
+    if not guild_id or not DATABASE_URL or not guild_has_premium(guild_id):
+        return None
+    if guild_id in guild_brand_cache:
+        return guild_brand_cache[guild_id]
+
+    try:
+        with connect_db(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT display_name, tagline, embed_color
+                    FROM labelutils_guild_branding
+                    WHERE guild_id = %s;
+                    """,
+                    (guild_id,),
+                )
+                row = cur.fetchone()
+    except Exception:
+        logger.exception("Failed to fetch guild branding for %s.", guild_id)
+        guild_brand_cache[guild_id] = None
+        return None
+
+    brand = (
+        {"display_name": row[0], "tagline": row[1], "embed_color": row[2]}
+        if row
+        else None
+    )
+    guild_brand_cache[guild_id] = brand
+    return brand
+
+
+def set_guild_brand(
+    guild_id: int,
+    updated_by: int,
+    display_name: str,
+    tagline: str,
+    embed_color: int,
+) -> bool:
+    if not DATABASE_URL:
+        logger.warning("DATABASE_URL is missing; cannot save guild branding.")
+        return False
+
+    safe_display_name = truncate_text(display_name.strip(), 80)
+    safe_tagline = truncate_text(tagline.strip(), 180)
+    try:
+        with connect_db(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO labelutils_guild_branding (
+                        guild_id, display_name, tagline, embed_color, updated_by, updated_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, NOW()
+                    )
+                    ON CONFLICT (guild_id)
+                    DO UPDATE SET
+                        display_name = EXCLUDED.display_name,
+                        tagline = EXCLUDED.tagline,
+                        embed_color = EXCLUDED.embed_color,
+                        updated_by = EXCLUDED.updated_by,
+                        updated_at = NOW();
+                    """,
+                    (guild_id, safe_display_name, safe_tagline, embed_color, updated_by),
+                )
+        guild_brand_cache[guild_id] = {
+            "display_name": safe_display_name,
+            "tagline": safe_tagline,
+            "embed_color": embed_color,
+        }
+        return True
+    except Exception:
+        logger.exception("Failed to save guild branding for %s.", guild_id)
+        return False
+
+
+def reset_guild_brand(guild_id: int) -> bool:
+    if not DATABASE_URL:
+        logger.warning("DATABASE_URL is missing; cannot reset guild branding.")
+        return False
+
+    try:
+        with connect_db(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM labelutils_guild_branding WHERE guild_id = %s;",
+                    (guild_id,),
+                )
+        guild_brand_cache.pop(guild_id, None)
+        return True
+    except Exception:
+        logger.exception("Failed to reset guild branding for %s.", guild_id)
         return False
 
 
@@ -815,9 +933,26 @@ def truncate_text(value: object, limit: int = 900) -> str:
 
 
 def server_display_name(interaction: discord.Interaction) -> str:
+    brand = get_guild_brand(interaction.guild_id)
+    if brand and brand.get("display_name"):
+        return str(brand["display_name"])
     if interaction.guild and interaction.guild.name:
         return interaction.guild.name
     return "this server"
+
+
+def server_embed_color(interaction: discord.Interaction, default: int = 0x5865F2) -> int:
+    brand = get_guild_brand(interaction.guild_id)
+    if brand and brand.get("embed_color") is not None:
+        return int(brand["embed_color"])
+    return default
+
+
+def server_tagline(interaction: discord.Interaction) -> str | None:
+    brand = get_guild_brand(interaction.guild_id)
+    if brand and brand.get("tagline"):
+        return str(brand["tagline"])
+    return None
 
 
 class LabelUtilsClient(discord.Client):
@@ -1435,7 +1570,11 @@ class AdvancedSubmissionModal(discord.ui.Modal, title="New Label Submission"):
             user_id=artist_id,
         )
 
-        embed = discord.Embed(title="New Label Submission", color=0x2B2D31)
+        embed = discord.Embed(
+            title="New Label Submission",
+            description=server_tagline(interaction),
+            color=server_embed_color(interaction, 0x2B2D31),
+        )
         embed.add_field(name="Ticket ID", value=ticket_id, inline=False)
         embed.add_field(name="User ID", value=str(artist_id), inline=False)
         embed.add_field(name="Name", value=self.real_name.value, inline=True)
@@ -1589,6 +1728,17 @@ async def setup_status(interaction: discord.Interaction):
     database_status_text = "Connected" if database_url else "Not connected"
     premium = get_premium_guild(interaction.guild_id)
     premium_status = f"{premium[0]} until {premium[1]}" if premium else "Not active"
+    brand = get_guild_brand(interaction.guild_id)
+    if brand:
+        brand_name = brand.get("display_name") or server_display_name(interaction)
+        brand_color = brand.get("embed_color")
+        brand_status = (
+            f"{brand_name} (#{int(brand_color):06X})"
+            if brand_color is not None
+            else f"{brand_name} (default color)"
+        )
+    else:
+        brand_status = "Default server branding"
     staff_status = (
         f"Connected: {staff_channel.mention}"
         if isinstance(staff_channel, discord.TextChannel)
@@ -1603,6 +1753,7 @@ async def setup_status(interaction: discord.Interaction):
     embed.add_field(name="Encryption Key", value=encryption_status, inline=True)
     embed.add_field(name="Server Database", value=database_status_text, inline=True)
     embed.add_field(name="Premium", value=premium_status, inline=True)
+    embed.add_field(name="Branding", value=brand_status, inline=False)
     embed.add_field(name="Staff Channel", value=staff_status, inline=False)
     embed.add_field(name="Submission Threads", value=thread_status, inline=False)
     embed.set_footer(text="Run /setup_database and /setup_staff_channel to complete setup.")
@@ -1616,7 +1767,7 @@ async def premium(interaction: discord.Interaction):
     embed = discord.Embed(title="LabelUtils Premium", color=0xF1C40F)
     if premium_row:
         plan, expires_at = premium_row
-        embed.description = f"This server has **{plan}** premium until **{expires_at}**."
+        embed.description = f"This server has the **{plan}** planuntil **{expires_at}**."
     else:
         embed.description = PREMIUM_CONTACT
     embed.add_field(
@@ -1695,6 +1846,108 @@ async def premium_remove(interaction: discord.Interaction, guild_id: str):
         else "No active premium record was found for that server."
     )
     await interaction.followup.send(text, ephemeral=True)
+
+
+@tree.command(name="setup_brand", description="Pro: customize this server's LabelUtils branding")
+@app_commands.describe(
+    display_name="Name shown in DMs and submission footers",
+    color="Embed color as a hex code, like #5865F2",
+    tagline="Short status/tagline shown on new submission cards",
+)
+async def setup_brand(
+    interaction: discord.Interaction,
+    display_name: str,
+    color: str,
+    tagline: str = "",
+):
+    logger.info("Received /setup_brand from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    if not interaction.guild_id:
+        await interaction.response.send_message("Brand setup must be run inside a server.", ephemeral=True)
+        return
+    if not user_is_admin(interaction):
+        await interaction.response.send_message("Only administrators can configure branding.", ephemeral=True)
+        return
+    if not guild_has_premium(interaction.guild_id):
+        await interaction.response.send_message(
+            "This is a Pro feature. Use `/premium` to see how to upgrade.",
+            ephemeral=True,
+        )
+        return
+
+    parsed_color = parse_hex_color(color)
+    if parsed_color is None:
+        await interaction.response.send_message(
+            "Please use a valid hex color like `#5865F2`.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    saved = set_guild_brand(
+        interaction.guild_id,
+        interaction.user.id,
+        display_name,
+        tagline,
+        parsed_color,
+    )
+    if not saved:
+        await interaction.followup.send("I could not save this server's branding.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="Branding Updated",
+        description=truncate_text(tagline, 180) if tagline else None,
+        color=parsed_color,
+    )
+    embed.add_field(name="Display Name", value=truncate_text(display_name, 80), inline=False)
+    embed.set_footer(text="This branding appears in supported server-specific LabelUtils messages.")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@tree.command(name="brand_status", description="Show this server's Pro branding")
+async def brand_status(interaction: discord.Interaction):
+    logger.info("Received /brand_status from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    await interaction.response.defer(ephemeral=True)
+    premium_row = get_premium_guild(interaction.guild_id)
+    brand = get_guild_brand(interaction.guild_id)
+    embed = discord.Embed(title="Brand Status", color=server_embed_color(interaction))
+    embed.add_field(
+        name="Premium",
+        value=f"{premium_row[0]} until {premium_row[1]}" if premium_row else "Not active",
+        inline=False,
+    )
+    embed.add_field(name="Display Name", value=server_display_name(interaction), inline=False)
+    embed.add_field(name="Tagline", value=server_tagline(interaction) or "Not set", inline=False)
+    embed.add_field(
+        name="Color",
+        value=f"#{server_embed_color(interaction):06X}" if brand else "Default",
+        inline=False,
+    )
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@tree.command(name="brand_reset", description="Pro: reset this server's custom branding")
+async def brand_reset(interaction: discord.Interaction):
+    logger.info("Received /brand_reset from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    if not interaction.guild_id:
+        await interaction.response.send_message("Brand reset must be run inside a server.", ephemeral=True)
+        return
+    if not user_is_admin(interaction):
+        await interaction.response.send_message("Only administrators can reset branding.", ephemeral=True)
+        return
+    if not guild_has_premium(interaction.guild_id):
+        await interaction.response.send_message(
+            "This is a Pro feature. Use `/premium` to see how to upgrade.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    reset = reset_guild_brand(interaction.guild_id)
+    await interaction.followup.send(
+        "Branding reset to server defaults." if reset else "I could not reset branding.",
+        ephemeral=True,
+    )
 
 
 @tree.command(name="my_submissions", description="Show your submissions in this server")
