@@ -15,7 +15,7 @@ LabelUtils Discord submission bot.
 Add these runtime secrets/environment variables:
 
 - `DISCORD_BOT_TOKEN`
-- `DATABASE_URL` bot-owner control database for encrypted server settings
+- `DATABASE_URL` bot-owner control database for encrypted server database URLs, staff channel IDs, and manual premium grants
 - `CONFIG_ENCRYPTION_KEY` Fernet key used to encrypt server database URLs
 - `DISCORD_GUILD_ID` strongly recommended while testing so slash-command changes appear immediately in that server
 - `STAFF_CHANNEL_ID` optional fallback staff channel for single-server installs
@@ -33,7 +33,7 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 
 After the bot is running, a server administrator should run:
 
-- `/setup_database` to paste that server's Neon PostgreSQL URL. LabelUtils tests the connection, creates the `label_submissions` table if needed, then stores the URL encrypted in the bot-owner control database.
+- `/setup_database` to paste that server's Neon PostgreSQL URL. LabelUtils tests the connection, creates the submissions, branding, and Pro settings tables if needed, then stores the URL encrypted in the bot-owner control database.
 - `/setup_staff_channel` to choose where new submissions are sent for that server.
 - `/setup_status` to verify the server database, staff channel, and required bot-owner config.
 
@@ -59,7 +59,10 @@ Premium is manually managed through the control database:
 - `/analytics` shows submission analytics.
 - `/export_submissions` exports a CSV.
 
+Each server's submissions, Pro branding, and Pro settings are stored in that server's configured Neon database. The owner control database only stores the encrypted server database link, staff-channel setup, and premium status.
+
 Submission threads also receive release logs for submission creation, approval, rejection, and staff DM actions.
+Visible submission and premium dates use Discord native timestamps, so Discord renders them in each user's local timezone.
 
 Discord does not support changing a bot's actual avatar or online presence separately per server. Pro branding is server-specific inside LabelUtils messages and embeds, and `/setup_brand` also tries to update the bot's server nickname when Discord permissions allow it.
 

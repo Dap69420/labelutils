@@ -80,6 +80,37 @@ CREATE TABLE IF NOT EXISTS label_submissions (
 );
 """
 
+GUILD_BRANDING_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS labelutils_guild_branding (
+    guild_id BIGINT PRIMARY KEY,
+    display_name TEXT,
+    tagline TEXT,
+    embed_color INTEGER,
+    updated_by BIGINT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"""
+
+PRO_SETTINGS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS labelutils_pro_settings (
+    guild_id BIGINT PRIMARY KEY,
+    message_label TEXT,
+    message_placeholder TEXT,
+    approval_template TEXT,
+    rejection_template TEXT,
+    cooldown_minutes INTEGER,
+    max_submissions_per_user INTEGER,
+    duplicate_policy TEXT,
+    approved_channel_id BIGINT,
+    rejected_channel_id BIGINT,
+    footer_text TEXT,
+    logo_url TEXT,
+    success_message TEXT,
+    updated_by BIGINT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"""
+
 
 intents = discord.Intents.default()
 
@@ -128,6 +159,28 @@ def parse_hex_color(value: str) -> int | None:
         return int(cleaned, 16)
     except ValueError:
         return None
+
+
+def discord_timestamp(value: object, style: str = "f") -> str:
+    if value is None:
+        return "Unknown"
+
+    parsed = value
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return value
+
+    if isinstance(parsed, datetime):
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return f"<t:{int(parsed.timestamp())}:{style}>"
+
+    try:
+        return f"<t:{int(float(parsed))}:{style}>"
+    except (TypeError, ValueError):
+        return str(value)
 
 
 def encryption_ready() -> bool:
@@ -216,39 +269,6 @@ def ensure_control_tables() -> None:
                     );
                     """
                 )
-                cur.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS labelutils_guild_branding (
-                        guild_id BIGINT PRIMARY KEY,
-                        display_name TEXT,
-                        tagline TEXT,
-                        embed_color INTEGER,
-                        updated_by BIGINT NOT NULL,
-                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                    );
-                    """
-                )
-                cur.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS labelutils_pro_settings (
-                        guild_id BIGINT PRIMARY KEY,
-                        message_label TEXT,
-                        message_placeholder TEXT,
-                        approval_template TEXT,
-                        rejection_template TEXT,
-                        cooldown_minutes INTEGER,
-                        max_submissions_per_user INTEGER,
-                        duplicate_policy TEXT,
-                        approved_channel_id BIGINT,
-                        rejected_channel_id BIGINT,
-                        footer_text TEXT,
-                        logo_url TEXT,
-                        success_message TEXT,
-                        updated_by BIGINT NOT NULL,
-                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                    );
-                    """
-                )
     except Exception:
         logger.exception("Failed to ensure LabelUtils control tables.")
 
@@ -258,6 +278,8 @@ def ensure_submission_table(database_url: str) -> bool:
         with connect_db(database_url) as conn:
             with conn.cursor() as cur:
                 cur.execute(SUBMISSIONS_TABLE_SQL)
+                cur.execute(GUILD_BRANDING_TABLE_SQL)
+                cur.execute(PRO_SETTINGS_TABLE_SQL)
                 cur.execute(
                     """
                     ALTER TABLE label_submissions
@@ -317,6 +339,8 @@ def set_guild_database_url(guild_id: int, configured_by: int, database_url: str)
                     (guild_id, encrypted_database_url, configured_by),
                 )
         guild_database_cache[guild_id] = database_url
+        guild_brand_cache.pop(guild_id, None)
+        guild_pro_settings_cache.pop(guild_id, None)
         return True
     except Exception:
         logger.exception("Failed to save guild database URL for %s.", guild_id)
@@ -503,14 +527,48 @@ def remove_premium_guild(guild_id: int) -> bool:
         return False
 
 
+def fetch_legacy_guild_brand(guild_id: int) -> dict[str, object] | None:
+    if not DATABASE_URL:
+        return None
+
+    try:
+        with connect_db(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT display_name, tagline, embed_color
+                    FROM labelutils_guild_branding
+                    WHERE guild_id = %s;
+                    """,
+                    (guild_id,),
+                )
+                row = cur.fetchone()
+    except psycopg.errors.UndefinedTable:
+        return None
+    except Exception:
+        logger.exception("Failed to fetch legacy guild branding for %s.", guild_id)
+        return None
+
+    return (
+        {"display_name": row[0], "tagline": row[1], "embed_color": row[2]}
+        if row
+        else None
+    )
+
+
 def get_guild_brand(guild_id: int | None) -> dict[str, object] | None:
-    if not guild_id or not DATABASE_URL or not guild_has_premium(guild_id):
+    if not guild_id or not guild_has_premium(guild_id):
         return None
     if guild_id in guild_brand_cache:
         return guild_brand_cache[guild_id]
 
+    database_url = get_guild_database_url(guild_id)
+    if not database_url or not ensure_submission_table(database_url):
+        guild_brand_cache[guild_id] = None
+        return None
+
     try:
-        with connect_db(DATABASE_URL) as conn:
+        with connect_db(database_url) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -525,6 +583,18 @@ def get_guild_brand(guild_id: int | None) -> dict[str, object] | None:
         logger.exception("Failed to fetch guild branding for %s.", guild_id)
         guild_brand_cache[guild_id] = None
         return None
+
+    if not row:
+        legacy_brand = fetch_legacy_guild_brand(guild_id)
+        if legacy_brand:
+            set_guild_brand(
+                guild_id,
+                0,
+                str(legacy_brand.get("display_name") or ""),
+                str(legacy_brand.get("tagline") or ""),
+                int(legacy_brand.get("embed_color") or 0x5865F2),
+            )
+            return get_guild_brand(guild_id)
 
     brand = (
         {"display_name": row[0], "tagline": row[1], "embed_color": row[2]}
@@ -542,14 +612,17 @@ def set_guild_brand(
     tagline: str,
     embed_color: int,
 ) -> bool:
-    if not DATABASE_URL:
-        logger.warning("DATABASE_URL is missing; cannot save guild branding.")
+    database_url = get_guild_database_url(guild_id)
+    if not database_url:
+        logger.warning("Guild database URL is missing; cannot save guild branding.")
+        return False
+    if not ensure_submission_table(database_url):
         return False
 
     safe_display_name = truncate_text(display_name.strip(), 80)
     safe_tagline = truncate_text(tagline.strip(), 180)
     try:
-        with connect_db(DATABASE_URL) as conn:
+        with connect_db(database_url) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -580,12 +653,15 @@ def set_guild_brand(
 
 
 def reset_guild_brand(guild_id: int) -> bool:
-    if not DATABASE_URL:
-        logger.warning("DATABASE_URL is missing; cannot reset guild branding.")
+    database_url = get_guild_database_url(guild_id)
+    if not database_url:
+        logger.warning("Guild database URL is missing; cannot reset guild branding.")
+        return False
+    if not ensure_submission_table(database_url):
         return False
 
     try:
-        with connect_db(DATABASE_URL) as conn:
+        with connect_db(database_url) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "DELETE FROM labelutils_guild_branding WHERE guild_id = %s;",
@@ -620,16 +696,57 @@ DEFAULT_PRO_SETTINGS: dict[str, object] = {
 }
 
 
+PRO_SETTINGS_KEYS = [
+    "message_label", "message_placeholder", "approval_template", "rejection_template",
+    "cooldown_minutes", "max_submissions_per_user", "duplicate_policy",
+    "approved_channel_id", "rejected_channel_id", "footer_text", "logo_url",
+    "success_message",
+]
+
+
+def fetch_legacy_pro_settings(guild_id: int) -> dict[str, object]:
+    if not DATABASE_URL:
+        return {}
+
+    try:
+        with connect_db(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        message_label, message_placeholder, approval_template, rejection_template,
+                        cooldown_minutes, max_submissions_per_user, duplicate_policy,
+                        approved_channel_id, rejected_channel_id, footer_text, logo_url,
+                        success_message
+                    FROM labelutils_pro_settings
+                    WHERE guild_id = %s;
+                    """,
+                    (guild_id,),
+                )
+                row = cur.fetchone()
+    except psycopg.errors.UndefinedTable:
+        return {}
+    except Exception:
+        logger.exception("Failed to fetch legacy Pro settings for guild %s.", guild_id)
+        return {}
+
+    return {key: value for key, value in zip(PRO_SETTINGS_KEYS, row or []) if value not in {None, ""}}
+
+
 def get_pro_settings(guild_id: int | None) -> dict[str, object]:
     settings = dict(DEFAULT_PRO_SETTINGS)
-    if not guild_id or not DATABASE_URL or not guild_has_premium(guild_id):
+    if not guild_id or not guild_has_premium(guild_id):
         return settings
     if guild_id in guild_pro_settings_cache:
         settings.update(guild_pro_settings_cache[guild_id])
         return settings
 
+    database_url = get_guild_database_url(guild_id)
+    if not database_url or not ensure_submission_table(database_url):
+        return settings
+
     try:
-        with connect_db(DATABASE_URL) as conn:
+        with connect_db(database_url) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -649,21 +766,24 @@ def get_pro_settings(guild_id: int | None) -> dict[str, object]:
         return settings
 
     if row:
-        keys = [
-            "message_label", "message_placeholder", "approval_template", "rejection_template",
-            "cooldown_minutes", "max_submissions_per_user", "duplicate_policy",
-            "approved_channel_id", "rejected_channel_id", "footer_text", "logo_url",
-            "success_message",
-        ]
-        loaded = {key: value for key, value in zip(keys, row) if value not in {None, ""}}
+        loaded = {key: value for key, value in zip(PRO_SETTINGS_KEYS, row) if value not in {None, ""}}
         guild_pro_settings_cache[guild_id] = loaded
         settings.update(loaded)
+    else:
+        legacy_settings = fetch_legacy_pro_settings(guild_id)
+        if legacy_settings:
+            upsert_pro_settings(guild_id, 0, **legacy_settings)
+            guild_pro_settings_cache[guild_id] = legacy_settings
+            settings.update(legacy_settings)
     return settings
 
 
 def upsert_pro_settings(guild_id: int, updated_by: int, **values: object) -> bool:
-    if not DATABASE_URL:
-        logger.warning("DATABASE_URL is missing; cannot save Pro settings.")
+    database_url = get_guild_database_url(guild_id)
+    if not database_url:
+        logger.warning("Guild database URL is missing; cannot save Pro settings.")
+        return False
+    if not ensure_submission_table(database_url):
         return False
 
     allowed = {
@@ -682,7 +802,7 @@ def upsert_pro_settings(guild_id: int, updated_by: int, **values: object) -> boo
     params = [guild_id, *updates.values(), updated_by]
 
     try:
-        with connect_db(DATABASE_URL) as conn:
+        with connect_db(database_url) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     f"""
@@ -850,7 +970,7 @@ def append_staff_note(database_url: str | None, ticket_id: str, note: str, staff
     if not database_url:
         return False
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    timestamp = discord_timestamp(datetime.now(timezone.utc))
     entry = f"[{timestamp} by {staff_name}] {note.strip()}"
     try:
         with connect_db(database_url) as conn:
@@ -1527,7 +1647,7 @@ def panel_embed(
             f"Artists: {truncate_text(artist_names, 180)}\n"
             f"Demo: {truncate_text(track_link, 220)}\n"
             f"Message: {truncate_text(message, 300)}\n"
-            f"Created: {created_at}"
+            f"Created: {discord_timestamp(created_at)}"
         )
         embed.add_field(
             name=f"{ticket_id} | {status_value} | {truncate_text(track_name, 120)}",
@@ -1669,7 +1789,7 @@ def queue_list_embed(rows: list[tuple]) -> discord.Embed:
                 f"Artists: {truncate_text(artist_names, 180)}\n"
                 f"Submitter: {truncate_text(name, 120)}\n"
                 f"Status: {status_value}\n"
-                f"Created: {created_at}"
+                f"Created: {discord_timestamp(created_at)}"
             ),
             inline=False,
         )
@@ -1701,7 +1821,7 @@ def queue_detail_embed(row: tuple, index: int, total: int) -> discord.Embed:
     embed.add_field(name="Artist Names", value=truncate_text(artist_names, 900), inline=False)
     embed.add_field(name="Demo Link", value=truncate_text(track_link, 900), inline=False)
     embed.add_field(name="Message", value=truncate_text(message, 900), inline=False)
-    embed.set_footer(text=f"Created: {created_at}")
+    embed.add_field(name="Created", value=discord_timestamp(created_at), inline=False)
     return embed
 
 
@@ -2133,7 +2253,7 @@ async def setup_status(interaction: discord.Interaction):
     encryption_status = "Configured" if encryption_ready() else "Missing or invalid"
     database_status_text = "Connected" if database_url else "Not connected"
     premium = get_premium_guild(interaction.guild_id)
-    premium_status = f"{premium[0]} until {premium[1]}" if premium else "Not active"
+    premium_status = f"{premium[0]} until {discord_timestamp(premium[1])}" if premium else "Not active"
     brand = get_guild_brand(interaction.guild_id)
     if brand:
         brand_name = brand.get("display_name") or server_display_name(interaction)
@@ -2173,7 +2293,7 @@ async def premium(interaction: discord.Interaction):
     embed = discord.Embed(title="LabelUtils Premium", color=0xF1C40F)
     if premium_row:
         plan, expires_at = premium_row
-        embed.description = f"This server has the **{plan}** plan until **{expires_at}**."
+        embed.description = f"This server has the **{plan}** plan until {discord_timestamp(expires_at)}."
     else:
         embed.description = PREMIUM_CONTACT
     embed.add_field(
@@ -2190,7 +2310,7 @@ async def premium_status(interaction: discord.Interaction):
     premium_row = get_premium_guild(interaction.guild_id)
     if premium_row:
         plan, expires_at = premium_row
-        text = f"This server has **{plan}** premium until **{expires_at}**."
+        text = f"This server has **{plan}** premium until {discord_timestamp(expires_at)}."
     else:
         text = f"This server does not have premium.\n{PREMIUM_CONTACT}"
     await interaction.response.send_message(text, ephemeral=True)
@@ -2779,7 +2899,7 @@ def submissions_to_embed(title: str, rows: list[tuple]) -> discord.Embed:
     for ticket_id, name, track_name, status_value, created_at in rows:
         embed.add_field(
             name=f"{ticket_id} - {status_value}",
-            value=f"{track_name} by {name}\nCreated: {created_at}",
+            value=f"{track_name} by {name}\nCreated: {discord_timestamp(created_at)}",
             inline=False,
         )
     return embed
@@ -2794,7 +2914,7 @@ def user_submissions_embed(rows: list[tuple]) -> discord.Embed:
     for ticket_id, track_name, status_value, created_at in rows:
         embed.add_field(
             name=f"{track_name} - {status_value}",
-            value=f"Ticket: `{ticket_id}`\nCreated: {created_at}",
+            value=f"Ticket: `{ticket_id}`\nCreated: {discord_timestamp(created_at)}",
             inline=False,
         )
     return embed
