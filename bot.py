@@ -2190,18 +2190,63 @@ async def premium_remove(interaction: discord.Interaction, guild_id: str):
     await interaction.followup.send(text, ephemeral=True)
 
 
+class BrandSetupModal(discord.ui.Modal, title="Setup Pro Branding"):
+    display_name = discord.ui.TextInput(
+        label="Display Name",
+        placeholder="Name shown in DMs, footers, and bot server nickname",
+        max_length=80,
+        required=True,
+    )
+    caption = discord.ui.TextInput(
+        label="Submit Panel Caption",
+        placeholder="Text shown in the submit panel embed",
+        style=discord.TextStyle.paragraph,
+        max_length=180,
+        required=True,
+    )
+    color = discord.ui.TextInput(
+        label="Embed Color",
+        placeholder="#5865F2",
+        max_length=7,
+        required=True,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        parsed_color = parse_hex_color(self.color.value)
+        if parsed_color is None:
+            await interaction.response.send_message(
+                "Please use a valid hex color like `#5865F2`.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        saved = set_guild_brand(
+            interaction.guild_id,
+            interaction.user.id,
+            self.display_name.value,
+            self.caption.value,
+            parsed_color,
+        )
+        if not saved:
+            await interaction.followup.send("I could not save this server's branding.", ephemeral=True)
+            return
+
+        nickname_status = await set_bot_server_nickname(interaction, self.display_name.value)
+        embed = discord.Embed(
+            title="Branding Updated",
+            description=truncate_text(self.caption.value, 180),
+            color=parsed_color,
+        )
+        embed.add_field(name="Display Name", value=truncate_text(self.display_name.value, 80), inline=False)
+        embed.add_field(name="Server Nickname", value=nickname_status, inline=False)
+        embed.add_field(name="Submit Panel Caption", value=truncate_text(self.caption.value, 180), inline=False)
+        embed.set_footer(text="This branding appears in supported server-specific LabelUtils messages.")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
 @tree.command(name="setup_brand", description="Pro: customize this server's LabelUtils branding")
-@app_commands.describe(
-    display_name="Name shown in DMs and submission footers",
-    color="Embed color as a hex code, like #5865F2",
-    tagline="Short status/tagline shown on new submission cards",
-)
-async def setup_brand(
-    interaction: discord.Interaction,
-    display_name: str,
-    color: str,
-    tagline: str = "",
-):
+async def setup_brand(interaction: discord.Interaction):
     logger.info("Received /setup_brand from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
     if not interaction.guild_id:
         await interaction.response.send_message("Brand setup must be run inside a server.", ephemeral=True)
@@ -2216,36 +2261,7 @@ async def setup_brand(
         )
         return
 
-    parsed_color = parse_hex_color(color)
-    if parsed_color is None:
-        await interaction.response.send_message(
-            "Please use a valid hex color like `#5865F2`.",
-            ephemeral=True,
-        )
-        return
-
-    await interaction.response.defer(ephemeral=True)
-    saved = set_guild_brand(
-        interaction.guild_id,
-        interaction.user.id,
-        display_name,
-        tagline,
-        parsed_color,
-    )
-    if not saved:
-        await interaction.followup.send("I could not save this server's branding.", ephemeral=True)
-        return
-
-    nickname_status = await set_bot_server_nickname(interaction, display_name)
-    embed = discord.Embed(
-        title="Branding Updated",
-        description=truncate_text(tagline, 180) if tagline else None,
-        color=parsed_color,
-    )
-    embed.add_field(name="Display Name", value=truncate_text(display_name, 80), inline=False)
-    embed.add_field(name="Server Nickname", value=nickname_status, inline=False)
-    embed.set_footer(text="This branding appears in supported server-specific LabelUtils messages.")
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    await interaction.response.send_modal(BrandSetupModal())
 
 
 @tree.command(name="brand_status", description="Show this server's Pro branding")
@@ -2266,7 +2282,7 @@ async def brand_status(interaction: discord.Interaction):
         value=interaction.guild.me.display_name if interaction.guild and interaction.guild.me else "Unavailable",
         inline=False,
     )
-    embed.add_field(name="Tagline", value=server_tagline(interaction) or "Not set", inline=False)
+    embed.add_field(name="Submit Panel Caption", value=server_tagline(interaction) or "Not set", inline=False)
     embed.add_field(
         name="Color",
         value=f"#{server_embed_color(interaction):06X}" if brand else "Default",

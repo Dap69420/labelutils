@@ -45,7 +45,7 @@ Premium is manually managed through the control database:
 - `/premium_status` checks the current server's premium state.
 - `/premium_add` grants premium to a server. Owner-only via `OWNER_USER_IDS`.
 - `/premium_remove` removes premium from a server. Owner-only via `OWNER_USER_IDS`.
-- `/setup_brand` lets Pro servers customize the display name, embed color, and tagline used in supported server-specific messages.
+- `/setup_brand` opens a form where Pro servers customize the display name, embed color, and submit panel caption used in supported server-specific messages.
 - `/brand_status` shows the active brand settings.
 - `/brand_reset` resets branding to server defaults.
 - `/setup_form` customizes the optional submission prompt.
