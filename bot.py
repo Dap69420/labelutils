@@ -152,6 +152,15 @@ def parse_snowflake(value: str) -> int | None:
     return int(cleaned)
 
 
+def normalize_ticket_id(value: str) -> str:
+    return value.strip().strip("`").upper()
+
+
+def normalize_coupon_code(value: str) -> str:
+    cleaned = value.strip().strip("`").upper()
+    return "".join(ch for ch in cleaned if ch.isalnum() or ch == "-")
+
+
 def parse_hex_color(value: str) -> int | None:
     cleaned = value.strip().lstrip("#")
     if len(cleaned) != 6:
@@ -266,6 +275,20 @@ def ensure_control_tables() -> None:
                         plan TEXT NOT NULL,
                         expires_at TIMESTAMPTZ NOT NULL,
                         added_by BIGINT NOT NULL,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS labelutils_premium_coupons (
+                        coupon_code TEXT PRIMARY KEY,
+                        plan TEXT NOT NULL,
+                        days INTEGER NOT NULL,
+                        uses_remaining INTEGER NOT NULL,
+                        max_uses INTEGER NOT NULL,
+                        created_by BIGINT NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     );
                     """
@@ -526,6 +549,115 @@ def add_premium_guild(guild_id: int, plan: str, days: int, added_by: int) -> boo
     except Exception:
         logger.exception("Failed to add premium for guild %s.", guild_id)
         return False
+
+
+def generate_coupon_code() -> str:
+    parts = [
+        "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
+        for _ in range(3)
+    ]
+    return f"LU-{'-'.join(parts)}"
+
+
+def create_premium_coupon(
+    plan: str,
+    days: int,
+    uses: int,
+    created_by: int,
+    code: str | None = None,
+) -> tuple[bool, str]:
+    if not DATABASE_URL:
+        logger.warning("DATABASE_URL is missing; cannot create premium coupon.")
+        return False, "Control database is not configured."
+
+    safe_plan = truncate_text(plan.strip() or "pro", 80)
+    safe_days = max(1, min(days, 3650))
+    safe_uses = max(1, min(uses, 10000))
+    coupon_code = normalize_coupon_code(code or generate_coupon_code())
+    if len(coupon_code) < 6:
+        return False, "Coupon code must be at least 6 characters."
+
+    try:
+        with connect_db(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO labelutils_premium_coupons (
+                        coupon_code, plan, days, uses_remaining, max_uses,
+                        created_by, created_at, updated_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, NOW(), NOW()
+                    );
+                    """,
+                    (coupon_code, safe_plan, safe_days, safe_uses, safe_uses, created_by),
+                )
+        return True, coupon_code
+    except psycopg.errors.UniqueViolation:
+        return False, "That coupon code already exists. Try another code."
+    except Exception:
+        logger.exception("Failed to create premium coupon %s.", coupon_code)
+        return False, "Could not create coupon. Check the control database logs."
+
+
+def redeem_premium_coupon(guild_id: int, code: str, redeemed_by: int) -> tuple[bool, str]:
+    if not DATABASE_URL:
+        logger.warning("DATABASE_URL is missing; cannot redeem premium coupon.")
+        return False, "Control database is not configured."
+
+    coupon_code = normalize_coupon_code(code)
+    if not coupon_code:
+        return False, "Please enter a valid coupon code."
+
+    try:
+        with connect_db(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT plan, days, uses_remaining
+                    FROM labelutils_premium_coupons
+                    WHERE coupon_code = %s
+                    FOR UPDATE;
+                    """,
+                    (coupon_code,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return False, "That premium coupon does not exist."
+
+                plan, days, uses_remaining = row
+                if int(uses_remaining or 0) <= 0:
+                    return False, "That premium coupon has no uses remaining."
+
+                cur.execute(
+                    """
+                    INSERT INTO labelutils_premium_guilds (
+                        guild_id, plan, expires_at, added_by, updated_at
+                    ) VALUES (
+                        %s, %s, NOW() + (%s * INTERVAL '1 day'), %s, NOW()
+                    )
+                    ON CONFLICT (guild_id)
+                    DO UPDATE SET
+                        plan = EXCLUDED.plan,
+                        expires_at = GREATEST(labelutils_premium_guilds.expires_at, NOW())
+                            + (%s * INTERVAL '1 day'),
+                        added_by = EXCLUDED.added_by,
+                        updated_at = NOW();
+                    """,
+                    (guild_id, plan, days, redeemed_by, days),
+                )
+                cur.execute(
+                    """
+                    UPDATE labelutils_premium_coupons
+                    SET uses_remaining = uses_remaining - 1,
+                        updated_at = NOW()
+                    WHERE coupon_code = %s;
+                    """,
+                    (coupon_code,),
+                )
+        return True, f"Redeemed `{coupon_code}` for {days} day(s) of **{plan}** premium."
+    except Exception:
+        logger.exception("Failed to redeem premium coupon %s for guild %s.", coupon_code, guild_id)
+        return False, "Could not redeem that coupon. Check the bot logs."
 
 
 def remove_premium_guild(guild_id: int) -> bool:
@@ -1010,6 +1142,30 @@ def fetch_user_submissions(database_url: str | None, user_id: int, limit: int = 
         return []
 
 
+def fetch_submission_by_ticket(database_url: str | None, ticket_id: str) -> tuple | None:
+    if not database_url:
+        return None
+
+    normalized_ticket_id = normalize_ticket_id(ticket_id)
+    try:
+        with connect_db(database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        ticket_id, user_id, name, discord_username, track_name, track_link,
+                        artist_names, message, status, created_at, reviewer_id, staff_notes
+                    FROM label_submissions
+                    WHERE upper(ticket_id) = %s;
+                    """,
+                    (normalized_ticket_id,),
+                )
+                return cur.fetchone()
+    except Exception:
+        logger.exception("Failed to fetch submission ticket %s.", normalized_ticket_id)
+        return None
+
+
 def fetch_user_submission_stats(database_url: str | None, user_id: int) -> tuple[int, int, int, int]:
     if not database_url:
         return (0, 0, 0, 0)
@@ -1047,6 +1203,7 @@ def append_staff_note(database_url: str | None, ticket_id: str, note: str, staff
     if not database_url:
         return False
 
+    normalized_ticket_id = normalize_ticket_id(ticket_id)
     timestamp = discord_timestamp(datetime.now(timezone.utc))
     entry = f"[{timestamp} by {staff_name}] {note.strip()}"
     try:
@@ -1056,13 +1213,13 @@ def append_staff_note(database_url: str | None, ticket_id: str, note: str, staff
                     """
                     UPDATE label_submissions
                     SET staff_notes = trim(concat_ws(E'\n', NULLIF(staff_notes, ''), %s))
-                    WHERE ticket_id = %s;
+                    WHERE upper(ticket_id) = %s;
                     """,
-                    (entry, ticket_id),
+                    (entry, normalized_ticket_id),
                 )
                 return cur.rowcount > 0
     except Exception:
-        logger.exception("Failed to append staff note for %s.", ticket_id)
+        logger.exception("Failed to append staff note for %s.", normalized_ticket_id)
         return False
 
 
@@ -1070,16 +1227,17 @@ def assign_reviewer(database_url: str | None, ticket_id: str, reviewer_id: int) 
     if not database_url:
         return False
 
+    normalized_ticket_id = normalize_ticket_id(ticket_id)
     try:
         with connect_db(database_url) as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "UPDATE label_submissions SET reviewer_id = %s WHERE ticket_id = %s;",
-                    (reviewer_id, ticket_id),
+                    "UPDATE label_submissions SET reviewer_id = %s WHERE upper(ticket_id) = %s;",
+                    (reviewer_id, normalized_ticket_id),
                 )
                 return cur.rowcount > 0
     except Exception:
-        logger.exception("Failed to assign reviewer for %s.", ticket_id)
+        logger.exception("Failed to assign reviewer for %s.", normalized_ticket_id)
         return False
 
 
@@ -1189,16 +1347,17 @@ def update_submission_status(database_url: str | None, ticket_id: str, new_statu
         logger.warning("Guild database URL is missing; cannot update ticket %s.", ticket_id)
         return False
 
+    normalized_ticket_id = normalize_ticket_id(ticket_id)
     try:
         with connect_db(database_url) as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "UPDATE label_submissions SET status = %s WHERE ticket_id = %s;",
-                    (new_status, ticket_id),
+                    "UPDATE label_submissions SET status = %s WHERE upper(ticket_id) = %s;",
+                    (new_status, normalized_ticket_id),
                 )
                 return cur.rowcount > 0
     except Exception:
-        logger.exception("Failed to update submission status for %s.", ticket_id)
+        logger.exception("Failed to update submission status for %s.", normalized_ticket_id)
         return False
 
 
@@ -1500,6 +1659,15 @@ def truncate_text(value: object, limit: int = 900) -> str:
     if len(text) <= limit:
         return text
     return f"{text[: limit - 3]}..."
+
+
+def clean_submission_message(value: object) -> str:
+    text = str(value or "").strip()
+    if text.startswith("[User ID:"):
+        closing = text.find("]")
+        if closing != -1:
+            return text[closing + 1 :].strip() or "None"
+    return text or "None"
 
 
 def server_display_name(interaction: discord.Interaction) -> str:
@@ -2284,6 +2452,51 @@ async def submit(interaction: discord.Interaction):
     await interaction.response.send_modal(AdvancedSubmissionModal(interaction.guild_id))
 
 
+@tree.command(name="help", description="Show LabelUtils commands and setup steps")
+async def help_command(interaction: discord.Interaction):
+    logger.info("Received /help from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    premium_active = guild_has_premium(interaction.guild_id)
+    embed = discord.Embed(
+        title="LabelUtils Help",
+        description=(
+            "Submit demos, review them with staff, and keep artists updated."
+        ),
+        color=server_embed_color(interaction),
+    )
+    embed.add_field(
+        name="For Artists",
+        value=(
+            "`/submit` - send a demo\n"
+            "`/ticket` - check a ticket\n"
+            "`/my_submissions` - view your submissions\n"
+            "`/my_stats` - view your acceptance stats\n"
+            "`/accepted_leaderboard` - see accepted submitters"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="For Staff",
+        value=(
+            "`/queue`, `/recent`, `/panel` - browse submissions\n"
+            "`/status` - update a ticket\n"
+            "`/setup_database`, `/setup_staff_channel`, `/setup_status` - setup"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Pro",
+        value=(
+            "`/premium` and `/premium_redeem` - upgrade this server\n"
+            "`/setup_brand`, `/setup_templates`, `/setup_limits`, `/setup_routing` - customize workflows\n"
+            "`/staff_note`, `/assign_reviewer`, `/analytics`, `/export_submissions` - staff tools\n"
+            "Artist replies to staff DMs forward into staff threads."
+        ),
+        inline=False,
+    )
+    embed.set_footer(text=f"Premium: {'active' if premium_active else 'not active'}")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 class SubmitPanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -2485,6 +2698,55 @@ async def premium_status(interaction: discord.Interaction):
     await interaction.response.send_message(text, ephemeral=True)
 
 
+@tree.command(name="premium_redeem", description="Admin: redeem a premium coupon for this server")
+@app_commands.describe(code="Premium coupon code")
+async def premium_redeem(interaction: discord.Interaction, code: str):
+    logger.info("Received /premium_redeem from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    if not interaction.guild_id:
+        await interaction.response.send_message("Premium coupons must be redeemed inside a server.", ephemeral=True)
+        return
+    if not user_is_admin(interaction):
+        await interaction.response.send_message("Only administrators can redeem premium for this server.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    redeemed, message = redeem_premium_coupon(interaction.guild_id, code, interaction.user.id)
+    await interaction.followup.send(message if redeemed else f"Could not redeem coupon: {message}", ephemeral=True)
+
+
+@tree.command(name="premium_coupon_create", description="Owner: create a reusable premium coupon")
+@app_commands.describe(
+    days="Premium days granted per redemption",
+    uses="How many times this coupon can be redeemed",
+    plan="Plan name, such as pro",
+    code="Optional custom coupon code",
+)
+async def premium_coupon_create(
+    interaction: discord.Interaction,
+    days: int,
+    uses: int,
+    plan: str = "pro",
+    code: str = "",
+):
+    logger.info("Received /premium_coupon_create from user=%s.", interaction.user.id)
+    if not user_is_bot_owner(interaction.user.id):
+        await interaction.response.send_message("Only the bot owner can use this.", ephemeral=True)
+        return
+    if days < 1 or uses < 1:
+        await interaction.response.send_message("Days and uses must both be at least 1.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    created, result = create_premium_coupon(plan, days, uses, interaction.user.id, code or None)
+    if created:
+        await interaction.followup.send(
+            f"Premium coupon created: `{result}`\nPlan: `{plan}` | Days/use: `{days}` | Uses: `{uses}`",
+            ephemeral=True,
+        )
+    else:
+        await interaction.followup.send(f"Could not create coupon: {result}", ephemeral=True)
+
+
 @tree.command(name="premium_add", description="Owner: manually grant premium to a server")
 @app_commands.describe(
     guild_id="Discord server ID to grant premium to",
@@ -2626,7 +2888,7 @@ async def brand_status(interaction: discord.Interaction):
     embed = discord.Embed(title="Brand Status", color=server_embed_color(interaction))
     embed.add_field(
         name="Premium",
-        value=f"{premium_row[0]} until {premium_row[1]}" if premium_row else "Not active",
+        value=f"{premium_row[0]} until {discord_timestamp(premium_row[1])}" if premium_row else "Not active",
         inline=False,
     )
     embed.add_field(name="Display Name", value=server_display_name(interaction), inline=False)
@@ -2869,9 +3131,21 @@ async def staff_note(interaction: discord.Interaction, ticket_id: str, note: str
 
     await interaction.response.defer(ephemeral=True)
     database_url = get_guild_database_url(interaction.guild_id)
-    ensure_submission_table(database_url) if database_url else None
-    saved = append_staff_note(database_url, ticket_id.strip(), truncate_text(note, 1200), f"@{interaction.user.name}")
-    await interaction.followup.send("Staff note added." if saved else "Could not add that note.", ephemeral=True)
+    if not database_url:
+        await interaction.followup.send("This server has not connected a submissions database yet.", ephemeral=True)
+        return
+    if not ensure_submission_table(database_url):
+        await interaction.followup.send("I could not reach this server's submissions database.", ephemeral=True)
+        return
+
+    normalized_ticket_id = normalize_ticket_id(ticket_id)
+    saved = append_staff_note(database_url, normalized_ticket_id, truncate_text(note, 1200), f"@{interaction.user.name}")
+    await interaction.followup.send(
+        f"Staff note added to `{normalized_ticket_id}`."
+        if saved
+        else f"Could not add that note. I could not find `{normalized_ticket_id}` in the database.",
+        ephemeral=True,
+    )
 
 
 @tree.command(name="assign_reviewer", description="Pro staff: assign a reviewer to a ticket")
@@ -2887,10 +3161,19 @@ async def assign_reviewer_command(interaction: discord.Interaction, ticket_id: s
 
     await interaction.response.defer(ephemeral=True)
     database_url = get_guild_database_url(interaction.guild_id)
-    ensure_submission_table(database_url) if database_url else None
-    saved = assign_reviewer(database_url, ticket_id.strip(), reviewer.id)
+    if not database_url:
+        await interaction.followup.send("This server has not connected a submissions database yet.", ephemeral=True)
+        return
+    if not ensure_submission_table(database_url):
+        await interaction.followup.send("I could not reach this server's submissions database.", ephemeral=True)
+        return
+
+    normalized_ticket_id = normalize_ticket_id(ticket_id)
+    saved = assign_reviewer(database_url, normalized_ticket_id, reviewer.id)
     await interaction.followup.send(
-        f"Reviewer assigned: {reviewer.mention}" if saved else "Could not assign reviewer.",
+        f"Reviewer assigned to `{normalized_ticket_id}`: {reviewer.mention}"
+        if saved
+        else f"Could not assign reviewer. I could not find `{normalized_ticket_id}` in the database.",
         ephemeral=True,
     )
 
@@ -2945,6 +3228,39 @@ async def export_submissions(interaction: discord.Interaction):
         file=discord.File(fp=BytesIO(data), filename="labelutils_submissions.csv"),
         ephemeral=True,
     )
+
+
+@tree.command(name="ticket", description="Look up a submission ticket")
+@app_commands.describe(ticket_id="Ticket ID, such as LABEL-ABCD1234-EFGH5678")
+async def ticket(interaction: discord.Interaction, ticket_id: str):
+    logger.info("Received /ticket from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    await interaction.response.defer(ephemeral=True)
+    database_url = get_guild_database_url(interaction.guild_id)
+    if not database_url:
+        await interaction.followup.send(
+            "This server has not connected a submissions database yet.",
+            ephemeral=True,
+        )
+        return
+
+    if not ensure_submission_table(database_url):
+        await interaction.followup.send("I could not reach this server's submissions database.", ephemeral=True)
+        return
+
+    row = fetch_submission_by_ticket(database_url, ticket_id)
+    if not row:
+        await interaction.followup.send("I could not find that ticket.", ephemeral=True)
+        return
+
+    viewer_is_staff = user_can_manage_submissions(interaction)
+    row_user_id = int(row[1] or 0)
+    message = str(row[7] or "")
+    owns_ticket = row_user_id == interaction.user.id or message.startswith(f"[User ID: {interaction.user.id}]")
+    if not viewer_is_staff and not owns_ticket:
+        await interaction.followup.send("You can only view tickets you submitted.", ephemeral=True)
+        return
+
+    await interaction.followup.send(embed=ticket_embed(row, viewer_is_staff), ephemeral=True)
 
 
 @tree.command(name="my_submissions", description="Show your submissions in this server")
@@ -3086,6 +3402,45 @@ def user_submissions_embed(rows: list[tuple]) -> discord.Embed:
             value=f"Ticket: `{ticket_id}`\nCreated: {discord_timestamp(created_at)}",
             inline=False,
         )
+    return embed
+
+
+def ticket_embed(row: tuple, viewer_is_staff: bool) -> discord.Embed:
+    (
+        ticket_id,
+        user_id,
+        name,
+        discord_username,
+        track_name,
+        track_link,
+        artist_names,
+        message,
+        status_value,
+        created_at,
+        reviewer_id,
+        staff_notes,
+    ) = row
+    embed = discord.Embed(
+        title=f"Ticket {ticket_id}",
+        description=f"**{truncate_text(track_name, 180)}**",
+        color=0x5865F2,
+    )
+    embed.add_field(name="Status", value=status_value, inline=True)
+    embed.add_field(name="Created", value=discord_timestamp(created_at), inline=True)
+    embed.add_field(name="Submitter", value=truncate_text(name, 120), inline=True)
+    embed.add_field(name="Discord", value=truncate_text(discord_username, 120), inline=True)
+    embed.add_field(name="Artists", value=truncate_text(artist_names, 500), inline=False)
+    embed.add_field(name="Demo Link", value=truncate_text(track_link, 900), inline=False)
+    embed.add_field(name="Message", value=truncate_text(clean_submission_message(message), 900), inline=False)
+    if viewer_is_staff:
+        embed.add_field(name="User ID", value=str(user_id or "Unknown"), inline=True)
+        embed.add_field(
+            name="Reviewer",
+            value=f"<@{reviewer_id}>" if reviewer_id else "Unassigned",
+            inline=True,
+        )
+        if staff_notes:
+            embed.add_field(name="Staff Notes", value=truncate_text(staff_notes, 1000), inline=False)
     return embed
 
 

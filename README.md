@@ -39,12 +39,14 @@ After the bot is running, a server administrator should run:
 - `/setup_staff_channel` to choose where new submissions are sent for that server.
 - `/setup_status` to verify the server database, staff channel, and required bot-owner config.
 
-Users can run `/my_submissions` or `/my_demos` to see their own ticket history, and `/my_stats` to see submitted/accepted counts. `/accepted_leaderboard` shows a paginated leaderboard of Discord submitters with the most accepted demos. New submissions are checked for duplicate demo links and each staff submission card opens a staff discussion thread when the bot has thread permissions.
+Users can run `/help` for the command list, `/ticket` to check one ticket, `/my_submissions` or `/my_demos` to see their own ticket history, and `/my_stats` to see submitted/accepted counts. `/accepted_leaderboard` shows a paginated leaderboard of Discord submitters with the most accepted demos. New submissions are checked for duplicate demo links and each staff submission card opens a staff discussion thread when the bot has thread permissions.
 
 Premium is manually managed through the control database:
 
 - `/premium` shows users how to contact you to buy premium.
 - `/premium_status` checks the current server's premium state.
+- `/premium_redeem` lets a server administrator redeem a premium coupon for the current server.
+- `/premium_coupon_create` creates a reusable premium coupon with a configurable use count. Owner-only via `OWNER_USER_IDS`.
 - `/premium_add` grants premium to a server. Owner-only via `OWNER_USER_IDS`.
 - `/premium_remove` removes premium from a server. Owner-only via `OWNER_USER_IDS`.
 - `/setup_brand` opens a form where Pro servers customize the display name, embed color, and submit panel caption used in supported server-specific messages.
@@ -66,6 +68,7 @@ Each server's submissions, Pro branding, and Pro settings are stored in that ser
 
 Submission threads also receive release logs for submission creation, approval, rejection, and staff DM actions.
 Visible submission and premium dates use Discord native timestamps, so Discord renders them in each user's local timezone.
+Discord modals support a maximum of five text inputs, so LabelUtils keeps the five core submission fields and Pro form customization currently changes the optional message field's label and placeholder.
 
 Discord does not support changing a bot's actual avatar or online presence separately per server. Pro branding is server-specific inside LabelUtils messages and embeds, and `/setup_brand` also tries to update the bot's server nickname when Discord permissions allow it.
 
