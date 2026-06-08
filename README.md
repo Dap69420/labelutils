@@ -25,6 +25,8 @@ Add these runtime secrets/environment variables:
 - `OWNER_USER_IDS` comma-separated Discord user IDs allowed to run owner-only premium commands
 - `PREMIUM_CONTACT` text shown by `/premium`, such as contact details and accepted crypto
 
+Enable Message Content Intent for the bot in the Discord Developer Portal if you want artist DM replies to staff messages to appear in the staff thread.
+
 Generate `CONFIG_ENCRYPTION_KEY` with:
 
 ```bash
@@ -63,6 +65,7 @@ Each server's submissions, Pro branding, and Pro settings are stored in that ser
 
 Submission threads also receive release logs for submission creation, approval, rejection, and staff DM actions.
 Visible submission and premium dates use Discord native timestamps, so Discord renders them in each user's local timezone.
+When staff sends an artist a DM from a submission card, the artist can reply to that specific bot DM and their reply will be forwarded into the submission's staff thread. Attachments are forwarded as Discord attachment links, so the bot does not download/reupload files into memory.
 
 Discord does not support changing a bot's actual avatar or online presence separately per server. Pro branding is server-specific inside LabelUtils messages and embeds, and `/setup_brand` also tries to update the bot's server nickname when Discord permissions allow it.
 

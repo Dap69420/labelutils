@@ -113,6 +113,7 @@ CREATE TABLE IF NOT EXISTS labelutils_pro_settings (
 
 
 intents = discord.Intents.default()
+intents.message_content = True
 
 
 def generate_ticket_id() -> str:
@@ -267,6 +268,24 @@ def ensure_control_tables() -> None:
                         added_by BIGINT NOT NULL,
                         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     );
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS labelutils_dm_routes (
+                        dm_message_id BIGINT PRIMARY KEY,
+                        guild_id BIGINT NOT NULL,
+                        ticket_id TEXT NOT NULL,
+                        thread_id BIGINT NOT NULL,
+                        user_id BIGINT NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_labelutils_dm_routes_user_id
+                    ON labelutils_dm_routes (user_id);
                     """
                 )
     except Exception:
@@ -525,6 +544,64 @@ def remove_premium_guild(guild_id: int) -> bool:
     except Exception:
         logger.exception("Failed to remove premium for guild %s.", guild_id)
         return False
+
+
+def save_dm_route(
+    dm_message_id: int,
+    guild_id: int,
+    ticket_id: str,
+    thread_id: int,
+    user_id: int,
+) -> bool:
+    if not DATABASE_URL:
+        logger.warning("DATABASE_URL is missing; cannot save DM reply route.")
+        return False
+
+    try:
+        with connect_db(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO labelutils_dm_routes (
+                        dm_message_id, guild_id, ticket_id, thread_id, user_id, created_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, NOW()
+                    )
+                    ON CONFLICT (dm_message_id)
+                    DO UPDATE SET
+                        guild_id = EXCLUDED.guild_id,
+                        ticket_id = EXCLUDED.ticket_id,
+                        thread_id = EXCLUDED.thread_id,
+                        user_id = EXCLUDED.user_id,
+                        created_at = NOW();
+                    """,
+                    (dm_message_id, guild_id, ticket_id, thread_id, user_id),
+                )
+        return True
+    except Exception:
+        logger.exception("Failed to save DM reply route for message %s.", dm_message_id)
+        return False
+
+
+def get_dm_route(dm_message_id: int, user_id: int) -> tuple[int, str, int] | None:
+    if not DATABASE_URL:
+        return None
+
+    try:
+        with connect_db(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT guild_id, ticket_id, thread_id
+                    FROM labelutils_dm_routes
+                    WHERE dm_message_id = %s AND user_id = %s;
+                    """,
+                    (dm_message_id, user_id),
+                )
+                return cur.fetchone()
+    except Exception:
+        logger.exception("Failed to fetch DM reply route for message %s.", dm_message_id)
+        return None
 
 
 def fetch_legacy_guild_brand(guild_id: int) -> dict[str, object] | None:
@@ -1272,6 +1349,73 @@ async def log_submission_thread(
         logger.exception("Failed to log to submission thread %s.", thread_id)
 
 
+def format_dm_reply_attachments(attachments: list[discord.Attachment]) -> str:
+    if not attachments:
+        return ""
+
+    lines = []
+    for attachment in attachments[:10]:
+        size_mb = attachment.size / (1024 * 1024) if attachment.size else 0
+        details = f"{attachment.filename}"
+        if attachment.content_type:
+            details = f"{details} ({attachment.content_type})"
+        if attachment.size:
+            details = f"{details}, {size_mb:.2f} MB"
+        lines.append(f"- [{details}]({attachment.url})")
+
+    if len(attachments) > 10:
+        lines.append(f"- plus {len(attachments) - 10} more attachment(s)")
+
+    return "\n".join(lines)
+
+
+async def forward_dm_reply_to_thread(message: discord.Message) -> bool:
+    if message.author.bot or message.guild is not None:
+        return False
+    if not message.reference or not message.reference.message_id:
+        return False
+
+    route = get_dm_route(message.reference.message_id, message.author.id)
+    if not route:
+        return False
+
+    guild_id, ticket_id, thread_id = route
+    thread = client.get_channel(thread_id)
+    if not thread:
+        try:
+            thread = await client.fetch_channel(thread_id)
+        except Exception:
+            logger.exception("Failed to fetch routed DM reply thread %s.", thread_id)
+            return False
+
+    attachments_text = format_dm_reply_attachments(list(message.attachments))
+    body = truncate_text(message.content, 1800) if message.content else ""
+    if not body and not attachments_text:
+        body = "Artist replied with an empty message."
+
+    embed = discord.Embed(
+        title="Artist DM Reply",
+        description=body or None,
+        color=0x5865F2,
+    )
+    embed.add_field(name="Ticket", value=f"`{ticket_id}`", inline=True)
+    embed.add_field(name="Artist", value=message.author.mention, inline=True)
+    embed.add_field(name="Received", value=discord_timestamp(message.created_at), inline=True)
+    if attachments_text:
+        embed.add_field(name="Attachments", value=truncate_text(attachments_text, 1000), inline=False)
+    embed.set_footer(text=f"Source DM reply ID: {message.id} | Guild: {guild_id}")
+
+    try:
+        await thread.send(
+            content=f"Reply from {message.author.mention} for `{ticket_id}`:",
+            embed=embed,
+        )
+        return True
+    except Exception:
+        logger.exception("Failed to forward DM reply %s to thread %s.", message.id, thread_id)
+        return False
+
+
 async def notify_artist(artist_id: int, embed: discord.Embed) -> bool:
     try:
         artist = await client.fetch_user(artist_id)
@@ -1284,16 +1428,15 @@ async def notify_artist(artist_id: int, embed: discord.Embed) -> bool:
         return False
 
 
-async def dm_artist_text(artist_id: int, content: str) -> bool:
+async def dm_artist_text(artist_id: int, content: str) -> discord.Message | None:
     try:
         artist = await client.fetch_user(artist_id)
         if not artist:
-            return False
-        await artist.send(content)
-        return True
+            return None
+        return await artist.send(content)
     except Exception:
         logger.exception("Could not send staff DM to user %s.", artist_id)
-        return False
+        return None
 
 
 async def send_status_route(
@@ -1526,19 +1669,32 @@ class StaffDmModal(discord.ui.Modal, title="DM Artist"):
         team_name = server_display_name(interaction)
         content = (
             f"Message from **{team_name}** about your submission "
-            f"**{track_name}** (`{ticket_id}`):\n\n{self.message.value}"
+            f"**{track_name}** (`{ticket_id}`):\n\n{self.message.value}\n\n"
+            "To reply to the team, use Discord's Reply action on this message."
         )
-        dm_sent = await dm_artist_text(artist_id, content)
+        dm_message = await dm_artist_text(artist_id, content)
+        dm_sent = bool(dm_message)
+        thread_id = submission_thread_id_from_message(self.staff_message)
+        route_saved = (
+            save_dm_route(dm_message.id, interaction.guild_id, ticket_id, thread_id, artist_id)
+            if dm_message and interaction.guild_id and thread_id
+            else False
+        )
         await log_submission_thread(
             self.staff_message,
             (
                 f"Release log: staff DM attempted by {interaction.user.mention}.\n"
                 f"DM status: {'sent' if dm_sent else 'failed'}\n"
+                f"Reply route: {'enabled' if route_saved else 'not enabled'}\n"
                 f"Message: {truncate_text(self.message.value, 1200)}"
             ),
         )
         if dm_sent:
-            await interaction.followup.send("DM sent to the artist. Status was not changed.", ephemeral=True)
+            reply_note = " Artist replies will appear in this thread." if route_saved else ""
+            await interaction.followup.send(
+                f"DM sent to the artist. Status was not changed.{reply_note}",
+                ephemeral=True,
+            )
         else:
             await interaction.followup.send("Could not DM that artist. Status was not changed.", ephemeral=True)
 
@@ -3064,6 +3220,11 @@ async def on_ready():
     logger.info("Targeting sync table: label_submissions")
 
 
+@client.event
+async def on_message(message: discord.Message):
+    await forward_dm_reply_to_thread(message)
+
+
 def validate_startup_environment() -> bool:
     ok = True
     if not TOKEN:
@@ -3073,6 +3234,8 @@ def validate_startup_environment() -> bool:
         logger.warning("DATABASE_URL is missing. Per-server database setup will fail.")
     if not CONFIG_ENCRYPTION_KEY:
         logger.warning("CONFIG_ENCRYPTION_KEY is missing. Per-server database setup will fail.")
+    if not intents.message_content:
+        logger.warning("Message Content Intent is disabled. DM reply forwarding will not work.")
     if not OWNER_USER_IDS:
         logger.warning("OWNER_USER_IDS is missing. Owner-only premium commands will reject everyone.")
     if DEFAULT_STAFF_CHANNEL_ID == 0:
