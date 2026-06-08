@@ -49,7 +49,7 @@ Premium is manually managed through the control database:
 - `/brand_status` shows the active brand settings.
 - `/brand_reset` resets branding to server defaults.
 
-Discord does not support changing a bot's actual avatar or online presence separately per server. Pro branding is server-specific inside LabelUtils messages and embeds.
+Discord does not support changing a bot's actual avatar or online presence separately per server. Pro branding is server-specific inside LabelUtils messages and embeds, and `/setup_brand` also tries to update the bot's server nickname when Discord permissions allow it.
 
 The app exposes a small health endpoint on `/` and `/health` while the Discord bot runs in the same process.
 

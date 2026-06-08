@@ -955,6 +955,34 @@ def server_tagline(interaction: discord.Interaction) -> str | None:
     return None
 
 
+async def set_bot_server_nickname(
+    interaction: discord.Interaction,
+    display_name: str | None,
+) -> str:
+    if not interaction.guild or not interaction.guild.me:
+        return "Nickname not changed: server member info was unavailable."
+
+    try:
+        nickname = truncate_text(display_name, 32) if display_name else None
+        await interaction.guild.me.edit(
+            nick=nickname,
+            reason=f"LabelUtils branding updated by {interaction.user}",
+        )
+        return (
+            f"Bot nickname changed to `{nickname}`."
+            if nickname
+            else "Bot nickname reset to default."
+        )
+    except discord.Forbidden:
+        return (
+            "Bot nickname not changed: give the bot Change Nickname or Manage Nicknames, "
+            "and keep its role above the bot member."
+        )
+    except Exception:
+        logger.exception("Failed to update bot server nickname for guild %s.", interaction.guild_id)
+        return "Bot nickname not changed because Discord returned an error."
+
+
 class LabelUtilsClient(discord.Client):
     async def setup_hook(self) -> None:
         self.add_view(DecisionButtonsView())
@@ -1767,7 +1795,7 @@ async def premium(interaction: discord.Interaction):
     embed = discord.Embed(title="LabelUtils Premium", color=0xF1C40F)
     if premium_row:
         plan, expires_at = premium_row
-        embed.description = f"This server has the **{plan}** planuntil **{expires_at}**."
+        embed.description = f"This server has the **{plan}** plan until **{expires_at}**."
     else:
         embed.description = PREMIUM_CONTACT
     embed.add_field(
@@ -1894,12 +1922,14 @@ async def setup_brand(
         await interaction.followup.send("I could not save this server's branding.", ephemeral=True)
         return
 
+    nickname_status = await set_bot_server_nickname(interaction, display_name)
     embed = discord.Embed(
         title="Branding Updated",
         description=truncate_text(tagline, 180) if tagline else None,
         color=parsed_color,
     )
     embed.add_field(name="Display Name", value=truncate_text(display_name, 80), inline=False)
+    embed.add_field(name="Server Nickname", value=nickname_status, inline=False)
     embed.set_footer(text="This branding appears in supported server-specific LabelUtils messages.")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -1917,6 +1947,11 @@ async def brand_status(interaction: discord.Interaction):
         inline=False,
     )
     embed.add_field(name="Display Name", value=server_display_name(interaction), inline=False)
+    embed.add_field(
+        name="Bot Server Nickname",
+        value=interaction.guild.me.display_name if interaction.guild and interaction.guild.me else "Unavailable",
+        inline=False,
+    )
     embed.add_field(name="Tagline", value=server_tagline(interaction) or "Not set", inline=False)
     embed.add_field(
         name="Color",
@@ -1944,8 +1979,9 @@ async def brand_reset(interaction: discord.Interaction):
 
     await interaction.response.defer(ephemeral=True)
     reset = reset_guild_brand(interaction.guild_id)
+    nickname_status = await set_bot_server_nickname(interaction, None) if reset else ""
     await interaction.followup.send(
-        "Branding reset to server defaults." if reset else "I could not reset branding.",
+        f"Branding reset to server defaults.\n{nickname_status}" if reset else "I could not reset branding.",
         ephemeral=True,
     )
 
