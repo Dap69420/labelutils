@@ -5,6 +5,8 @@ import socket
 import string
 import sys
 import time
+from io import BytesIO, StringIO
+import csv
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
@@ -58,6 +60,7 @@ submission_cooldowns: dict[int, datetime] = {}
 guild_database_cache: dict[int, str | None] = {}
 guild_staff_channel_cache: dict[int, int] = {}
 guild_brand_cache: dict[int, dict[str, object] | None] = {}
+guild_pro_settings_cache: dict[int, dict[str, object]] = {}
 
 
 SUBMISSIONS_TABLE_SQL = """
@@ -70,6 +73,8 @@ CREATE TABLE IF NOT EXISTS label_submissions (
     track_link TEXT NOT NULL,
     artist_names TEXT NOT NULL,
     message TEXT NOT NULL,
+    staff_notes TEXT NOT NULL DEFAULT '',
+    reviewer_id BIGINT,
     status TEXT NOT NULL DEFAULT 'In Queue',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -99,8 +104,8 @@ def get_cooldown_remaining(user_id: int) -> timedelta | None:
     return expires_at - now
 
 
-def set_submission_cooldown(user_id: int) -> None:
-    submission_cooldowns[user_id] = datetime.now(timezone.utc) + timedelta(minutes=COOLDOWN_MINUTES)
+def set_submission_cooldown(user_id: int, minutes: int = COOLDOWN_MINUTES) -> None:
+    submission_cooldowns[user_id] = datetime.now(timezone.utc) + timedelta(minutes=minutes)
 
 
 def is_valid_database_url(value: str) -> bool:
@@ -223,6 +228,27 @@ def ensure_control_tables() -> None:
                     );
                     """
                 )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS labelutils_pro_settings (
+                        guild_id BIGINT PRIMARY KEY,
+                        message_label TEXT,
+                        message_placeholder TEXT,
+                        approval_template TEXT,
+                        rejection_template TEXT,
+                        cooldown_minutes INTEGER,
+                        max_submissions_per_user INTEGER,
+                        duplicate_policy TEXT,
+                        approved_channel_id BIGINT,
+                        rejected_channel_id BIGINT,
+                        footer_text TEXT,
+                        logo_url TEXT,
+                        success_message TEXT,
+                        updated_by BIGINT NOT NULL,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                    """
+                )
     except Exception:
         logger.exception("Failed to ensure LabelUtils control tables.")
 
@@ -236,6 +262,13 @@ def ensure_submission_table(database_url: str) -> bool:
                     """
                     ALTER TABLE label_submissions
                     ADD COLUMN IF NOT EXISTS user_id BIGINT;
+                    """
+                )
+                cur.execute(
+                    """
+                    ALTER TABLE label_submissions
+                    ADD COLUMN IF NOT EXISTS staff_notes TEXT NOT NULL DEFAULT '',
+                    ADD COLUMN IF NOT EXISTS reviewer_id BIGINT;
                     """
                 )
                 cur.execute(
@@ -565,6 +598,119 @@ def reset_guild_brand(guild_id: int) -> bool:
         return False
 
 
+DEFAULT_PRO_SETTINGS: dict[str, object] = {
+    "message_label": "Message to Label",
+    "message_placeholder": "Share any extra notes about your track here...",
+    "approval_template": (
+        "Your track **{track_name}** has been approved by the team at **{team_name}**. "
+        "We will reach out with further details soon."
+    ),
+    "rejection_template": (
+        "Thank you for submitting **{track_name}** to **{team_name}**. "
+        "After review, your track was not selected at this time.\n\nReason: {reason}"
+    ),
+    "cooldown_minutes": COOLDOWN_MINUTES,
+    "max_submissions_per_user": 0,
+    "duplicate_policy": "block",
+    "approved_channel_id": 0,
+    "rejected_channel_id": 0,
+    "footer_text": "",
+    "logo_url": "",
+    "success_message": "Complete! Your submission has been logged. Ticket ID: `{ticket_id}`",
+}
+
+
+def get_pro_settings(guild_id: int | None) -> dict[str, object]:
+    settings = dict(DEFAULT_PRO_SETTINGS)
+    if not guild_id or not DATABASE_URL or not guild_has_premium(guild_id):
+        return settings
+    if guild_id in guild_pro_settings_cache:
+        settings.update(guild_pro_settings_cache[guild_id])
+        return settings
+
+    try:
+        with connect_db(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        message_label, message_placeholder, approval_template, rejection_template,
+                        cooldown_minutes, max_submissions_per_user, duplicate_policy,
+                        approved_channel_id, rejected_channel_id, footer_text, logo_url,
+                        success_message
+                    FROM labelutils_pro_settings
+                    WHERE guild_id = %s;
+                    """,
+                    (guild_id,),
+                )
+                row = cur.fetchone()
+    except Exception:
+        logger.exception("Failed to fetch Pro settings for guild %s.", guild_id)
+        return settings
+
+    if row:
+        keys = [
+            "message_label", "message_placeholder", "approval_template", "rejection_template",
+            "cooldown_minutes", "max_submissions_per_user", "duplicate_policy",
+            "approved_channel_id", "rejected_channel_id", "footer_text", "logo_url",
+            "success_message",
+        ]
+        loaded = {key: value for key, value in zip(keys, row) if value not in {None, ""}}
+        guild_pro_settings_cache[guild_id] = loaded
+        settings.update(loaded)
+    return settings
+
+
+def upsert_pro_settings(guild_id: int, updated_by: int, **values: object) -> bool:
+    if not DATABASE_URL:
+        logger.warning("DATABASE_URL is missing; cannot save Pro settings.")
+        return False
+
+    allowed = {
+        "message_label", "message_placeholder", "approval_template", "rejection_template",
+        "cooldown_minutes", "max_submissions_per_user", "duplicate_policy",
+        "approved_channel_id", "rejected_channel_id", "footer_text", "logo_url",
+        "success_message",
+    }
+    updates = {key: value for key, value in values.items() if key in allowed}
+    if not updates:
+        return True
+
+    columns = ["guild_id", *updates.keys(), "updated_by", "updated_at"]
+    placeholders = ["%s", *["%s" for _ in updates], "%s", "NOW()"]
+    update_sql = ", ".join(f"{key} = EXCLUDED.{key}" for key in updates)
+    params = [guild_id, *updates.values(), updated_by]
+
+    try:
+        with connect_db(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    INSERT INTO labelutils_pro_settings ({", ".join(columns)})
+                    VALUES ({", ".join(placeholders)})
+                    ON CONFLICT (guild_id)
+                    DO UPDATE SET
+                        {update_sql},
+                        updated_by = EXCLUDED.updated_by,
+                        updated_at = NOW();
+                    """,
+                    params,
+                )
+        guild_pro_settings_cache.pop(guild_id, None)
+        return True
+    except Exception:
+        logger.exception("Failed to save Pro settings for guild %s.", guild_id)
+        return False
+
+
+def format_template(template: object, **values: object) -> str:
+    try:
+        return str(template).format(**values)
+    except Exception:
+        logger.exception("Failed to format Pro template.")
+        return str(template)
+
+
 def save_submission_to_neon(
     database_url: str | None,
     ticket_id: str,
@@ -686,6 +832,97 @@ def fetch_user_submission_stats(database_url: str | None, user_id: int) -> tuple
     except Exception:
         logger.exception("Failed to fetch user submission stats.")
         return (0, 0, 0, 0)
+
+
+def count_user_submissions(database_url: str | None, user_id: int) -> int:
+    total, _approved, _rejected, _in_queue = fetch_user_submission_stats(database_url, user_id)
+    return total
+
+
+def append_staff_note(database_url: str | None, ticket_id: str, note: str, staff_name: str) -> bool:
+    if not database_url:
+        return False
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    entry = f"[{timestamp} by {staff_name}] {note.strip()}"
+    try:
+        with connect_db(database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE label_submissions
+                    SET staff_notes = trim(concat_ws(E'\n', NULLIF(staff_notes, ''), %s))
+                    WHERE ticket_id = %s;
+                    """,
+                    (entry, ticket_id),
+                )
+                return cur.rowcount > 0
+    except Exception:
+        logger.exception("Failed to append staff note for %s.", ticket_id)
+        return False
+
+
+def assign_reviewer(database_url: str | None, ticket_id: str, reviewer_id: int) -> bool:
+    if not database_url:
+        return False
+
+    try:
+        with connect_db(database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE label_submissions SET reviewer_id = %s WHERE ticket_id = %s;",
+                    (reviewer_id, ticket_id),
+                )
+                return cur.rowcount > 0
+    except Exception:
+        logger.exception("Failed to assign reviewer for %s.", ticket_id)
+        return False
+
+
+def fetch_submission_analytics(database_url: str | None) -> tuple[int, int, int, int]:
+    if not database_url:
+        return (0, 0, 0, 0)
+
+    try:
+        with connect_db(database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        COUNT(*),
+                        COUNT(*) FILTER (WHERE lower(status) = 'approved'),
+                        COUNT(*) FILTER (WHERE lower(status) = 'rejected'),
+                        COUNT(*) FILTER (WHERE lower(status) = 'in queue')
+                    FROM label_submissions;
+                    """
+                )
+                row = cur.fetchone()
+                return tuple(int(value or 0) for value in row) if row else (0, 0, 0, 0)
+    except Exception:
+        logger.exception("Failed to fetch analytics.")
+        return (0, 0, 0, 0)
+
+
+def fetch_submissions_for_export(database_url: str | None) -> list[tuple]:
+    if not database_url:
+        return []
+
+    try:
+        with connect_db(database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        ticket_id, user_id, name, discord_username, track_name, track_link,
+                        artist_names, message, status, created_at, reviewer_id, staff_notes
+                    FROM label_submissions
+                    ORDER BY created_at DESC;
+                    """
+                )
+                return cur.fetchall()
+    except Exception:
+        logger.exception("Failed to fetch submissions for export.")
+        return []
 
 
 def fetch_accepted_leaderboard(
@@ -901,6 +1138,35 @@ async def dm_artist_text(artist_id: int, content: str) -> bool:
         return False
 
 
+async def send_status_route(
+    interaction: discord.Interaction,
+    ticket_id: str,
+    track_name: str,
+    status_value: str,
+) -> None:
+    settings = get_pro_settings(interaction.guild_id)
+    key = "approved_channel_id" if status_value == "Approved" else "rejected_channel_id"
+    channel_id = int(settings.get(key) or 0)
+    if not channel_id:
+        return
+
+    channel = client.get_channel(channel_id)
+    if not channel and interaction.guild:
+        channel = interaction.guild.get_channel(channel_id)
+    if not isinstance(channel, discord.TextChannel):
+        return
+
+    try:
+        embed = discord.Embed(
+            title=f"Submission {status_value}",
+            description=f"**{truncate_text(track_name, 180)}**\nTicket: `{ticket_id}`",
+            color=0x43B581 if status_value == "Approved" else 0xF04747,
+        )
+        await channel.send(embed=embed)
+    except Exception:
+        logger.exception("Failed to send %s route message for %s.", status_value, ticket_id)
+
+
 def disable_view_items(view: discord.ui.View) -> None:
     for item in view.children:
         item.disabled = True
@@ -986,6 +1252,7 @@ async def set_bot_server_nickname(
 class LabelUtilsClient(discord.Client):
     async def setup_hook(self) -> None:
         self.add_view(DecisionButtonsView())
+        self.add_view(SubmitPanelView())
         command_names = ", ".join(command.name for command in tree.get_commands())
         logger.info("Registering slash command(s): %s", command_names)
         if DISCORD_GUILD_ID:
@@ -1041,15 +1308,18 @@ class RejectReasonModal(discord.ui.Modal, title="Reject Submission"):
         await interaction.response.defer(ephemeral=True)
         ticket_id, artist_id, track_name = submission_info_from_message(self.staff_message)
         team_name = server_display_name(interaction)
+        settings = get_pro_settings(interaction.guild_id)
         database_url = get_guild_database_url(interaction.guild_id)
         db_updated = update_submission_status(database_url, ticket_id, "Rejected")
 
         dm_embed = discord.Embed(
             title="Submission Update",
-            description=(
-                f"Thank you for submitting **{track_name}** to **{team_name}**. "
-                f"After review, your track was not selected at this time.\n\n"
-                f"Reason: {self.reason.value}"
+            description=format_template(
+                settings.get("rejection_template"),
+                track_name=track_name,
+                team_name=team_name,
+                reason=self.reason.value,
+                ticket_id=ticket_id,
             ),
             color=0xF04747,
         )
@@ -1067,6 +1337,7 @@ class RejectReasonModal(discord.ui.Modal, title="Reject Submission"):
         )
 
         await self.staff_message.edit(embed=old_embed, view=view)
+        await send_status_route(interaction, ticket_id, track_name, "Rejected")
         await interaction.followup.send("Rejected and processed.", ephemeral=True)
 
 
@@ -1111,14 +1382,17 @@ class DecisionButtonsView(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
         ticket_id, artist_id, track_name = submission_info_from_message(interaction.message)
         team_name = server_display_name(interaction)
+        settings = get_pro_settings(interaction.guild_id)
         database_url = get_guild_database_url(interaction.guild_id)
         db_updated = update_submission_status(database_url, ticket_id, "Approved")
 
         dm_embed = discord.Embed(
             title="Submission Approved",
-            description=(
-                f"Your track **{track_name}** has been approved by the team at "
-                f"**{team_name}**. We will reach out with further details soon."
+            description=format_template(
+                settings.get("approval_template"),
+                track_name=track_name,
+                team_name=team_name,
+                ticket_id=ticket_id,
             ),
             color=0x43B581,
         )
@@ -1135,6 +1409,7 @@ class DecisionButtonsView(discord.ui.View):
         )
 
         await interaction.message.edit(embed=old_embed, view=view)
+        await send_status_route(interaction, ticket_id, track_name, "Approved")
         await interaction.followup.send("Approved and processed.", ephemeral=True)
 
     @discord.ui.button(label="Reject", style=discord.ButtonStyle.red, custom_id="submission:reject")
@@ -1521,6 +1796,12 @@ class AdvancedSubmissionModal(discord.ui.Modal, title="New Label Submission"):
         required=False,
     )
 
+    def __init__(self, guild_id: int | None = None):
+        super().__init__()
+        settings = get_pro_settings(guild_id)
+        self.message.label = truncate_text(settings["message_label"], 45)
+        self.message.placeholder = truncate_text(settings["message_placeholder"], 100)
+
     async def on_submit(self, interaction: discord.Interaction):
         database_url = get_guild_database_url(interaction.guild_id)
         if not database_url:
@@ -1536,6 +1817,7 @@ class AdvancedSubmissionModal(discord.ui.Modal, title="New Label Submission"):
                 ephemeral=True,
             )
             return
+        settings = get_pro_settings(interaction.guild_id)
 
         remaining = get_cooldown_remaining(interaction.user.id)
         if remaining:
@@ -1566,19 +1848,27 @@ class AdvancedSubmissionModal(discord.ui.Modal, title="New Label Submission"):
         await interaction.response.defer(ephemeral=True)
         ensure_submission_table(database_url)
 
-        duplicate = find_duplicate_submission(database_url, self.demo_link.value)
-        if duplicate:
-            duplicate_ticket_id, duplicate_track_name, duplicate_status, _created_at = duplicate
+        max_submissions = int(settings.get("max_submissions_per_user") or 0)
+        if max_submissions and count_user_submissions(database_url, interaction.user.id) >= max_submissions:
             await interaction.followup.send(
-                (
-                    "That demo link has already been submitted in this server.\n"
-                    f"Existing ticket: `{duplicate_ticket_id}`\n"
-                    f"Track: **{truncate_text(duplicate_track_name, 120)}**\n"
-                    f"Status: **{duplicate_status}**"
-                ),
+                f"You have reached this server's limit of {max_submissions} submission(s).",
                 ephemeral=True,
             )
             return
+
+        duplicate = find_duplicate_submission(database_url, self.demo_link.value)
+        if duplicate:
+            duplicate_ticket_id, duplicate_track_name, duplicate_status, _created_at = duplicate
+            duplicate_text = (
+                "That demo link has already been submitted in this server.\n"
+                f"Existing ticket: `{duplicate_ticket_id}`\n"
+                f"Track: **{truncate_text(duplicate_track_name, 120)}**\n"
+                f"Status: **{duplicate_status}**"
+            )
+            if str(settings.get("duplicate_policy", "block")).lower() == "block":
+                await interaction.followup.send(duplicate_text, ephemeral=True)
+                return
+            await interaction.followup.send(f"Duplicate warning:\n{duplicate_text}", ephemeral=True)
 
         team_name = server_display_name(interaction)
         ticket_id = generate_ticket_id()
@@ -1598,11 +1888,15 @@ class AdvancedSubmissionModal(discord.ui.Modal, title="New Label Submission"):
             user_id=artist_id,
         )
 
+        footer_text = str(settings.get("footer_text") or f"{team_name} Management System")
+        logo_url = str(settings.get("logo_url") or "")
         embed = discord.Embed(
             title="New Label Submission",
             description=server_tagline(interaction),
             color=server_embed_color(interaction, 0x2B2D31),
         )
+        if is_valid_url(logo_url):
+            embed.set_thumbnail(url=logo_url)
         embed.add_field(name="Ticket ID", value=ticket_id, inline=False)
         embed.add_field(name="User ID", value=str(artist_id), inline=False)
         embed.add_field(name="Name", value=self.real_name.value, inline=True)
@@ -1613,14 +1907,17 @@ class AdvancedSubmissionModal(discord.ui.Modal, title="New Label Submission"):
         embed.add_field(name="Message", value=msg_val, inline=False)
 
         status_text = "Synced to Dashboard DB" if db_saved else "Logged to Channel Only (DB Sync Failure)"
-        embed.set_footer(text=f"{team_name} Management System | {status_text} | Pending Action")
+        embed.set_footer(text=f"{footer_text} | {status_text} | Pending Action")
 
         staff_message = await channel.send(embed=embed, view=DecisionButtonsView())
-        set_submission_cooldown(artist_id)
-        await interaction.followup.send(
-            f"Complete! Your submission has been logged. Ticket ID: `{ticket_id}`",
-            ephemeral=True,
+        set_submission_cooldown(artist_id, int(settings.get("cooldown_minutes") or COOLDOWN_MINUTES))
+        success_text = format_template(
+            settings.get("success_message"),
+            ticket_id=ticket_id,
+            track_name=self.track_name.value,
+            team_name=team_name,
         )
+        await interaction.followup.send(success_text, ephemeral=True)
         await create_submission_thread(
             staff_message,
             ticket_id,
@@ -1631,7 +1928,24 @@ class AdvancedSubmissionModal(discord.ui.Modal, title="New Label Submission"):
 
 @tree.command(name="submit", description="Submit your demo tracking profile to the label")
 async def submit(interaction: discord.Interaction):
-    await interaction.response.send_modal(AdvancedSubmissionModal())
+    await interaction.response.send_modal(AdvancedSubmissionModal(interaction.guild_id))
+
+
+class SubmitPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Submit Demo", style=discord.ButtonStyle.blurple, custom_id="submit_panel:open")
+    async def submit_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(AdvancedSubmissionModal(interaction.guild_id))
+
+
+def require_pro_admin(interaction: discord.Interaction) -> str | None:
+    if not user_is_admin(interaction):
+        return "Only administrators can use this Pro setup command."
+    if not guild_has_premium(interaction.guild_id):
+        return "This is a Pro feature. Use `/premium` to see how to upgrade."
+    return None
 
 
 @tree.command(name="setup_database", description="Admin: connect this server to a Neon database")
@@ -1982,6 +2296,260 @@ async def brand_reset(interaction: discord.Interaction):
     nickname_status = await set_bot_server_nickname(interaction, None) if reset else ""
     await interaction.followup.send(
         f"Branding reset to server defaults.\n{nickname_status}" if reset else "I could not reset branding.",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="setup_form", description="Pro: customize the optional submission question")
+@app_commands.describe(
+    label="Label for the final optional form field",
+    placeholder="Placeholder text for that field",
+)
+async def setup_form(interaction: discord.Interaction, label: str, placeholder: str):
+    logger.info("Received /setup_form from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    error = require_pro_admin(interaction)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+
+    saved = upsert_pro_settings(
+        interaction.guild_id,
+        interaction.user.id,
+        message_label=truncate_text(label, 45),
+        message_placeholder=truncate_text(placeholder, 100),
+    )
+    await interaction.response.send_message(
+        "Submission form prompt updated." if saved else "I could not save the form settings.",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="setup_templates", description="Pro: customize approval and rejection DMs")
+@app_commands.describe(
+    approval_template="Template for approval DMs. Supports {track_name}, {team_name}, {ticket_id}",
+    rejection_template="Template for rejection DMs. Also supports {reason}",
+)
+async def setup_templates(interaction: discord.Interaction, approval_template: str, rejection_template: str):
+    logger.info("Received /setup_templates from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    error = require_pro_admin(interaction)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+
+    saved = upsert_pro_settings(
+        interaction.guild_id,
+        interaction.user.id,
+        approval_template=truncate_text(approval_template, 1500),
+        rejection_template=truncate_text(rejection_template, 1500),
+    )
+    await interaction.response.send_message(
+        "DM templates updated." if saved else "I could not save the DM templates.",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="setup_limits", description="Pro: configure cooldowns, submission caps, and duplicate policy")
+@app_commands.describe(
+    cooldown_minutes="Minutes users must wait between submissions",
+    max_submissions_per_user="0 means unlimited total submissions per user",
+    duplicate_policy="block rejects duplicate links; warn allows them after warning",
+)
+@app_commands.choices(
+    duplicate_policy=[
+        app_commands.Choice(name="Block duplicates", value="block"),
+        app_commands.Choice(name="Warn only", value="warn"),
+    ]
+)
+async def setup_limits(
+    interaction: discord.Interaction,
+    cooldown_minutes: int,
+    max_submissions_per_user: int,
+    duplicate_policy: app_commands.Choice[str],
+):
+    logger.info("Received /setup_limits from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    error = require_pro_admin(interaction)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+
+    saved = upsert_pro_settings(
+        interaction.guild_id,
+        interaction.user.id,
+        cooldown_minutes=max(0, min(cooldown_minutes, 10080)),
+        max_submissions_per_user=max(0, min(max_submissions_per_user, 10000)),
+        duplicate_policy=duplicate_policy.value,
+    )
+    await interaction.response.send_message(
+        "Submission limits updated." if saved else "I could not save submission limits.",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="setup_routing", description="Pro: route approved/rejected updates to channels")
+@app_commands.describe(
+    approved_channel="Optional channel for approved submission updates",
+    rejected_channel="Optional channel for rejected submission updates",
+)
+async def setup_routing(
+    interaction: discord.Interaction,
+    approved_channel: discord.TextChannel | None = None,
+    rejected_channel: discord.TextChannel | None = None,
+):
+    logger.info("Received /setup_routing from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    error = require_pro_admin(interaction)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+
+    saved = upsert_pro_settings(
+        interaction.guild_id,
+        interaction.user.id,
+        approved_channel_id=approved_channel.id if approved_channel else 0,
+        rejected_channel_id=rejected_channel.id if rejected_channel else 0,
+    )
+    await interaction.response.send_message(
+        "Routing updated." if saved else "I could not save routing settings.",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="setup_brand_extras", description="Pro: set footer, logo, and submit success text")
+@app_commands.describe(
+    footer_text="Footer prefix on staff submission cards",
+    logo_url="Image URL used as submission thumbnail, or none",
+    success_message="Submitter confirmation. Supports {ticket_id}, {track_name}, {team_name}",
+)
+async def setup_brand_extras(
+    interaction: discord.Interaction,
+    footer_text: str,
+    logo_url: str,
+    success_message: str,
+):
+    logger.info("Received /setup_brand_extras from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    error = require_pro_admin(interaction)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+    if logo_url and logo_url.lower() != "none" and not is_valid_url(logo_url):
+        await interaction.response.send_message("Logo URL must be a valid http(s) URL or `none`.", ephemeral=True)
+        return
+
+    saved = upsert_pro_settings(
+        interaction.guild_id,
+        interaction.user.id,
+        footer_text=truncate_text(footer_text, 160),
+        logo_url="" if logo_url.lower() == "none" else truncate_text(logo_url, 500),
+        success_message=truncate_text(success_message, 500),
+    )
+    await interaction.response.send_message(
+        "Brand extras updated." if saved else "I could not save brand extras.",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="post_submit_panel", description="Pro: post a branded submit button panel")
+async def post_submit_panel(interaction: discord.Interaction):
+    logger.info("Received /post_submit_panel from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    error = require_pro_admin(interaction)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title=f"Submit to {server_display_name(interaction)}",
+        description=server_tagline(interaction) or "Click the button below to submit your demo.",
+        color=server_embed_color(interaction),
+    )
+    await interaction.response.send_message(embed=embed, view=SubmitPanelView())
+
+
+@tree.command(name="staff_note", description="Pro staff: add a private note to a ticket")
+@app_commands.describe(ticket_id="Ticket ID to annotate", note="Private staff note")
+async def staff_note(interaction: discord.Interaction, ticket_id: str, note: str):
+    logger.info("Received /staff_note from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    if not user_can_manage_submissions(interaction):
+        await interaction.response.send_message("You do not have permission to use this.", ephemeral=True)
+        return
+    if not guild_has_premium(interaction.guild_id):
+        await interaction.response.send_message("This is a Pro feature.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    database_url = get_guild_database_url(interaction.guild_id)
+    ensure_submission_table(database_url) if database_url else None
+    saved = append_staff_note(database_url, ticket_id.strip(), truncate_text(note, 1200), f"@{interaction.user.name}")
+    await interaction.followup.send("Staff note added." if saved else "Could not add that note.", ephemeral=True)
+
+
+@tree.command(name="assign_reviewer", description="Pro staff: assign a reviewer to a ticket")
+@app_commands.describe(ticket_id="Ticket ID to assign", reviewer="Reviewer responsible for this submission")
+async def assign_reviewer_command(interaction: discord.Interaction, ticket_id: str, reviewer: discord.Member):
+    logger.info("Received /assign_reviewer from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    if not user_can_manage_submissions(interaction):
+        await interaction.response.send_message("You do not have permission to use this.", ephemeral=True)
+        return
+    if not guild_has_premium(interaction.guild_id):
+        await interaction.response.send_message("This is a Pro feature.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    database_url = get_guild_database_url(interaction.guild_id)
+    ensure_submission_table(database_url) if database_url else None
+    saved = assign_reviewer(database_url, ticket_id.strip(), reviewer.id)
+    await interaction.followup.send(
+        f"Reviewer assigned: {reviewer.mention}" if saved else "Could not assign reviewer.",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="analytics", description="Pro admin: view advanced submission analytics")
+async def analytics(interaction: discord.Interaction):
+    logger.info("Received /analytics from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    error = require_pro_admin(interaction)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    database_url = get_guild_database_url(interaction.guild_id)
+    ensure_submission_table(database_url) if database_url else None
+    total, approved, rejected, in_queue = fetch_submission_analytics(database_url)
+    embed = discord.Embed(title="Submission Analytics", color=server_embed_color(interaction))
+    embed.add_field(name="Total", value=str(total), inline=True)
+    embed.add_field(name="Approved", value=str(approved), inline=True)
+    embed.add_field(name="In Queue", value=str(in_queue), inline=True)
+    embed.add_field(name="Rejected", value=str(rejected), inline=True)
+    embed.add_field(
+        name="Acceptance Rate",
+        value=f"{round((approved / total) * 100, 1)}%" if total else "0%",
+        inline=True,
+    )
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@tree.command(name="export_submissions", description="Pro admin: export submissions as CSV")
+async def export_submissions(interaction: discord.Interaction):
+    logger.info("Received /export_submissions from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    error = require_pro_admin(interaction)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    database_url = get_guild_database_url(interaction.guild_id)
+    ensure_submission_table(database_url) if database_url else None
+    rows = fetch_submissions_for_export(database_url)
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "ticket_id", "user_id", "name", "discord_username", "track_name", "track_link",
+        "artist_names", "message", "status", "created_at", "reviewer_id", "staff_notes",
+    ])
+    writer.writerows(rows)
+    data = output.getvalue().encode("utf-8")
+    await interaction.followup.send(
+        content=f"Exported {len(rows)} submission(s).",
+        file=discord.File(fp=BytesIO(data), filename="labelutils_submissions.csv"),
         ephemeral=True,
     )
 
