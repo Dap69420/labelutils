@@ -60,12 +60,12 @@ Premium is manually managed through the control database:
 - `/assign_reviewer` assigns staff reviewers to tickets.
 - `/analytics` shows submission analytics.
 - `/export_submissions` exports a CSV.
+- Artist replies to staff DMs are forwarded into the submission's staff thread. Attachments are forwarded as Discord attachment links, so the bot does not download/reupload files into memory.
 
 Each server's submissions, Pro branding, and Pro settings are stored in that server's configured Neon database. The owner control database only stores the encrypted server database link, staff-channel setup, and premium status.
 
 Submission threads also receive release logs for submission creation, approval, rejection, and staff DM actions.
 Visible submission and premium dates use Discord native timestamps, so Discord renders them in each user's local timezone.
-When staff sends an artist a DM from a submission card, the artist can reply to that specific bot DM and their reply will be forwarded into the submission's staff thread. Attachments are forwarded as Discord attachment links, so the bot does not download/reupload files into memory.
 
 Discord does not support changing a bot's actual avatar or online presence separately per server. Pro branding is server-specific inside LabelUtils messages and embeds, and `/setup_brand` also tries to update the bot's server nickname when Discord permissions allow it.
 

@@ -1380,6 +1380,9 @@ async def forward_dm_reply_to_thread(message: discord.Message) -> bool:
         return False
 
     guild_id, ticket_id, thread_id = route
+    if not guild_has_premium(guild_id):
+        return False
+
     thread = client.get_channel(thread_id)
     if not thread:
         try:
@@ -1667,25 +1670,35 @@ class StaffDmModal(discord.ui.Modal, title="DM Artist"):
         await interaction.response.defer(ephemeral=True)
         ticket_id, artist_id, track_name = submission_info_from_message(self.staff_message)
         team_name = server_display_name(interaction)
+        reply_bridge_enabled = guild_has_premium(interaction.guild_id)
         content = (
             f"Message from **{team_name}** about your submission "
-            f"**{track_name}** (`{ticket_id}`):\n\n{self.message.value}\n\n"
-            "To reply to the team, use Discord's Reply action on this message."
+            f"**{track_name}** (`{ticket_id}`):\n\n{self.message.value}"
         )
+        if reply_bridge_enabled:
+            content = (
+                f"{content}\n\n"
+                "To reply to the team, use Discord's Reply action on this message."
+            )
         dm_message = await dm_artist_text(artist_id, content)
         dm_sent = bool(dm_message)
         thread_id = submission_thread_id_from_message(self.staff_message)
         route_saved = (
             save_dm_route(dm_message.id, interaction.guild_id, ticket_id, thread_id, artist_id)
-            if dm_message and interaction.guild_id and thread_id
+            if reply_bridge_enabled and dm_message and interaction.guild_id and thread_id
             else False
         )
+        route_status = "enabled" if route_saved else "premium required"
+        if reply_bridge_enabled and dm_sent and not route_saved:
+            route_status = "not enabled"
+        elif not dm_sent:
+            route_status = "not enabled"
         await log_submission_thread(
             self.staff_message,
             (
                 f"Release log: staff DM attempted by {interaction.user.mention}.\n"
                 f"DM status: {'sent' if dm_sent else 'failed'}\n"
-                f"Reply route: {'enabled' if route_saved else 'not enabled'}\n"
+                f"Reply route: {route_status}\n"
                 f"Message: {truncate_text(self.message.value, 1200)}"
             ),
         )
