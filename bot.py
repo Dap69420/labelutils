@@ -711,6 +711,13 @@ def format_template(template: object, **values: object) -> str:
         return str(template)
 
 
+def format_rejection_template(template: object, reason: str, **values: object) -> str:
+    text = format_template(template, reason=reason, **values)
+    if "{reason}" not in str(template) and reason.strip():
+        text = f"{text}\n\nReason: {reason.strip()}"
+    return text
+
+
 def save_submission_to_neon(
     database_url: str | None,
     ticket_id: str,
@@ -1114,6 +1121,37 @@ def submission_info_from_message(message: discord.Message) -> tuple[str, int, st
     return ticket_id, user_id, track_name
 
 
+def submission_thread_id_from_message(message: discord.Message) -> int | None:
+    if not message.embeds:
+        return None
+    thread_id = embed_field(message.embeds[0], "Thread ID")
+    return int(thread_id) if thread_id.isdigit() else None
+
+
+async def log_submission_thread(
+    message: discord.Message,
+    content: str,
+    *,
+    embed: discord.Embed | None = None,
+) -> None:
+    thread_id = submission_thread_id_from_message(message)
+    if not thread_id:
+        return
+
+    thread = client.get_channel(thread_id)
+    if not thread:
+        try:
+            thread = await client.fetch_channel(thread_id)
+        except Exception:
+            logger.exception("Failed to fetch submission thread %s.", thread_id)
+            return
+
+    try:
+        await thread.send(content=content, embed=embed)
+    except Exception:
+        logger.exception("Failed to log to submission thread %s.", thread_id)
+
+
 async def notify_artist(artist_id: int, embed: discord.Embed) -> bool:
     try:
         artist = await client.fetch_user(artist_id)
@@ -1314,11 +1352,11 @@ class RejectReasonModal(discord.ui.Modal, title="Reject Submission"):
 
         dm_embed = discord.Embed(
             title="Submission Update",
-            description=format_template(
+            description=format_rejection_template(
                 settings.get("rejection_template"),
+                reason=self.reason.value,
                 track_name=track_name,
                 team_name=team_name,
-                reason=self.reason.value,
                 ticket_id=ticket_id,
             ),
             color=0xF04747,
@@ -1338,6 +1376,14 @@ class RejectReasonModal(discord.ui.Modal, title="Reject Submission"):
 
         await self.staff_message.edit(embed=old_embed, view=view)
         await send_status_route(interaction, ticket_id, track_name, "Rejected")
+        await log_submission_thread(
+            self.staff_message,
+            (
+                f"Release log: rejected by {interaction.user.mention}.\n"
+                f"Reason: {self.reason.value}\n"
+                f"{dm_status} | {db_status}"
+            ),
+        )
         await interaction.followup.send("Rejected and processed.", ephemeral=True)
 
 
@@ -1363,6 +1409,14 @@ class StaffDmModal(discord.ui.Modal, title="DM Artist"):
             f"**{track_name}** (`{ticket_id}`):\n\n{self.message.value}"
         )
         dm_sent = await dm_artist_text(artist_id, content)
+        await log_submission_thread(
+            self.staff_message,
+            (
+                f"Release log: staff DM attempted by {interaction.user.mention}.\n"
+                f"DM status: {'sent' if dm_sent else 'failed'}\n"
+                f"Message: {truncate_text(self.message.value, 1200)}"
+            ),
+        )
         if dm_sent:
             await interaction.followup.send("DM sent to the artist. Status was not changed.", ephemeral=True)
         else:
@@ -1410,6 +1464,10 @@ class DecisionButtonsView(discord.ui.View):
 
         await interaction.message.edit(embed=old_embed, view=view)
         await send_status_route(interaction, ticket_id, track_name, "Approved")
+        await log_submission_thread(
+            interaction.message,
+            f"Release log: approved by {interaction.user.mention}.\n{dm_status} | {db_status}",
+        )
         await interaction.followup.send("Approved and processed.", ephemeral=True)
 
     @discord.ui.button(label="Reject", style=discord.ButtonStyle.red, custom_id="submission:reject")
@@ -1918,12 +1976,18 @@ class AdvancedSubmissionModal(discord.ui.Modal, title="New Label Submission"):
             team_name=team_name,
         )
         await interaction.followup.send(success_text, ephemeral=True)
-        await create_submission_thread(
+        thread = await create_submission_thread(
             staff_message,
             ticket_id,
             self.track_name.value,
             artist_id,
         )
+        if thread:
+            embed.add_field(name="Thread ID", value=str(thread.id), inline=False)
+            await staff_message.edit(embed=embed, view=DecisionButtonsView())
+            await thread.send(
+                "Release log: submission received and staff card created."
+            )
 
 
 @tree.command(name="submit", description="Submit your demo tracking profile to the label")
@@ -2340,28 +2404,52 @@ async def setup_form(interaction: discord.Interaction, label: str, placeholder: 
     )
 
 
+class TemplateSetupModal(discord.ui.Modal, title="Setup DM Templates"):
+    approval_template = discord.ui.TextInput(
+        label="Approval Template",
+        placeholder="Leave blank to keep current. Supports {track_name}, {team_name}, {ticket_id}",
+        style=discord.TextStyle.paragraph,
+        max_length=1500,
+        required=False,
+    )
+    rejection_template = discord.ui.TextInput(
+        label="Rejection Template",
+        placeholder="Leave blank to keep current. Supports {track_name}, {team_name}, {ticket_id}, {reason}",
+        style=discord.TextStyle.paragraph,
+        max_length=1500,
+        required=False,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        updates = {}
+        approval_value = self.approval_template.value.strip()
+        rejection_value = self.rejection_template.value.strip()
+        if approval_value:
+            updates["approval_template"] = truncate_text(approval_value, 1500)
+        if rejection_value:
+            updates["rejection_template"] = truncate_text(rejection_value, 1500)
+
+        if not updates:
+            await interaction.response.send_message("No template changes were submitted.", ephemeral=True)
+            return
+
+        saved = upsert_pro_settings(interaction.guild_id, interaction.user.id, **updates)
+        changed = ", ".join(key.replace("_template", "") for key in updates)
+        await interaction.response.send_message(
+            f"Updated {changed} template(s)." if saved else "I could not save the DM templates.",
+            ephemeral=True,
+        )
+
+
 @tree.command(name="setup_templates", description="Pro: customize approval and rejection DMs")
-@app_commands.describe(
-    approval_template="Template for approval DMs. Supports {track_name}, {team_name}, {ticket_id}",
-    rejection_template="Template for rejection DMs. Also supports {reason}",
-)
-async def setup_templates(interaction: discord.Interaction, approval_template: str, rejection_template: str):
+async def setup_templates(interaction: discord.Interaction):
     logger.info("Received /setup_templates from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
     error = require_pro_admin(interaction)
     if error:
         await interaction.response.send_message(error, ephemeral=True)
         return
 
-    saved = upsert_pro_settings(
-        interaction.guild_id,
-        interaction.user.id,
-        approval_template=truncate_text(approval_template, 1500),
-        rejection_template=truncate_text(rejection_template, 1500),
-    )
-    await interaction.response.send_message(
-        "DM templates updated." if saved else "I could not save the DM templates.",
-        ephemeral=True,
-    )
+    await interaction.response.send_modal(TemplateSetupModal())
 
 
 @tree.command(name="setup_limits", description="Pro: configure cooldowns, submission caps, and duplicate policy")
@@ -2805,7 +2893,7 @@ async def create_submission_thread(
     ticket_id: str,
     track_name: str,
     submitter_id: int,
-) -> None:
+) -> discord.Thread | None:
     try:
         thread_name = truncate_text(f"{ticket_id} - {track_name}", 95)
         thread = await staff_message.create_thread(
@@ -2815,8 +2903,10 @@ async def create_submission_thread(
         await thread.send(
             f"Private staff discussion for `{ticket_id}`.\nSubmitter: <@{submitter_id}>"
         )
+        return thread
     except Exception:
         logger.exception("Failed to create staff thread for %s.", ticket_id)
+        return None
 
 
 @tree.command(name="queue", description="Staff: show the newest queued submissions")

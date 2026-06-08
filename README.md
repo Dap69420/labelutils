@@ -49,7 +49,7 @@ Premium is manually managed through the control database:
 - `/brand_status` shows the active brand settings.
 - `/brand_reset` resets branding to server defaults.
 - `/setup_form` customizes the optional submission prompt.
-- `/setup_templates` customizes approval/rejection DMs.
+- `/setup_templates` opens a form for approval/rejection DMs. Either field can be left blank to keep the current template.
 - `/setup_limits` configures cooldowns, submission caps, and duplicate-link policy.
 - `/setup_routing` routes approved/rejected updates to separate channels.
 - `/setup_brand_extras` sets footer text, logo thumbnail, and custom success message.
@@ -58,6 +58,8 @@ Premium is manually managed through the control database:
 - `/assign_reviewer` assigns staff reviewers to tickets.
 - `/analytics` shows submission analytics.
 - `/export_submissions` exports a CSV.
+
+Submission threads also receive release logs for submission creation, approval, rejection, and staff DM actions.
 
 Discord does not support changing a bot's actual avatar or online presence separately per server. Pro branding is server-specific inside LabelUtils messages and embeds, and `/setup_brand` also tries to update the bot's server nickname when Discord permissions allow it.
 
