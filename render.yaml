@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: labelutils
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: FORCE_IPV4
+        value: "0"

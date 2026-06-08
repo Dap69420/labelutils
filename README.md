@@ -72,3 +72,14 @@ python app.py
 ```
 
 `app.py` exists only as a conventional Python hosting entrypoint.
+
+## Render setup
+
+Create a Web Service from this repo and set:
+
+```bash
+Build Command: pip install -r requirements.txt
+Start Command: python bot.py
+```
+
+Do not use Render's default `gunicorn your_application.wsgi` command; this is a Discord bot, not a Django app.
