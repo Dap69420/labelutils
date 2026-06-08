@@ -106,7 +106,7 @@ LABEL_STATUSES = [
     "Approved",
     "Rejected",
 ]
-TICKET_STATUSES = ["Open", "Waiting", "Answered", "Closed"]
+TICKET_STATUSES = ["Open", "Waiting", "Answered", "Resolved"]
 
 SUBMISSIONS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS label_submissions (
@@ -170,6 +170,7 @@ CREATE TABLE IF NOT EXISTS labelutils_pro_settings (
     success_message TEXT,
     rejection_reasons TEXT,
     digest_channel_id BIGINT,
+    ticket_channel_id BIGINT,
     updated_by BIGINT NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -449,7 +450,8 @@ def ensure_submission_table(database_url: str) -> bool:
                     """
                     ALTER TABLE labelutils_pro_settings
                     ADD COLUMN IF NOT EXISTS rejection_reasons TEXT,
-                    ADD COLUMN IF NOT EXISTS digest_channel_id BIGINT;
+                    ADD COLUMN IF NOT EXISTS digest_channel_id BIGINT,
+                    ADD COLUMN IF NOT EXISTS ticket_channel_id BIGINT;
                     """
                 )
                 cur.execute(
@@ -1134,6 +1136,7 @@ DEFAULT_PRO_SETTINGS: dict[str, object] = {
     "success_message": "Complete! Your submission has been logged. Ticket ID: `{ticket_id}`",
     "rejection_reasons": "",
     "digest_channel_id": 0,
+    "ticket_channel_id": 0,
 }
 
 
@@ -1141,7 +1144,7 @@ PRO_SETTINGS_KEYS = [
     "message_label", "message_placeholder", "approval_template", "rejection_template",
     "cooldown_minutes", "max_submissions_per_user", "duplicate_policy",
     "approved_channel_id", "rejected_channel_id", "footer_text", "logo_url",
-    "success_message", "rejection_reasons", "digest_channel_id",
+    "success_message", "rejection_reasons", "digest_channel_id", "ticket_channel_id",
 ]
 
 
@@ -1196,7 +1199,7 @@ def get_pro_settings(guild_id: int | None) -> dict[str, object]:
                         message_label, message_placeholder, approval_template, rejection_template,
                         cooldown_minutes, max_submissions_per_user, duplicate_policy,
                         approved_channel_id, rejected_channel_id, footer_text, logo_url,
-                        success_message, rejection_reasons, digest_channel_id
+                        success_message, rejection_reasons, digest_channel_id, ticket_channel_id
                     FROM labelutils_pro_settings
                     WHERE guild_id = %s;
                     """,
@@ -1232,7 +1235,7 @@ def upsert_pro_settings(guild_id: int, updated_by: int, **values: object) -> boo
         "message_label", "message_placeholder", "approval_template", "rejection_template",
         "cooldown_minutes", "max_submissions_per_user", "duplicate_policy",
         "approved_channel_id", "rejected_channel_id", "footer_text", "logo_url",
-        "success_message", "rejection_reasons", "digest_channel_id",
+        "success_message", "rejection_reasons", "digest_channel_id", "ticket_channel_id",
     }
     updates = {key: value for key, value in values.items() if key in allowed}
     if not updates:
@@ -1924,6 +1927,22 @@ def submission_info_from_message(message: discord.Message) -> tuple[str, int, st
     return ticket_id, user_id, track_name
 
 
+def set_embed_field(embed: discord.Embed, name: str, value: str, inline: bool = False) -> None:
+    for index, field in enumerate(embed.fields):
+        if field.name == name:
+            embed.set_field_at(index, name=name, value=value, inline=inline)
+            return
+    embed.add_field(name=name, value=value, inline=inline)
+
+
+def support_ticket_info_from_message(message: discord.Message) -> tuple[str, int, str]:
+    embed = message.embeds[0]
+    ticket_id = embed_field(embed, "Ticket ID")
+    user_id = int(embed_field(embed, "User ID", "0"))
+    subject = embed.description or embed_field(embed, "Subject", "support ticket")
+    return ticket_id, user_id, subject
+
+
 def submission_thread_id_from_message(message: discord.Message) -> int | None:
     if not message.embeds:
         return None
@@ -2003,12 +2022,12 @@ async def forward_dm_reply_to_thread(message: discord.Message) -> bool:
         body = "Artist replied with an empty message."
 
     embed = discord.Embed(
-        title="Artist DM Reply",
+        title="User DM Reply",
         description=body or None,
         color=0x5865F2,
     )
     embed.add_field(name="Ticket", value=f"`{ticket_id}`", inline=True)
-    embed.add_field(name="Artist", value=message.author.mention, inline=True)
+    embed.add_field(name="User", value=message.author.mention, inline=True)
     embed.add_field(name="Received", value=discord_timestamp(message.created_at), inline=True)
     if attachments_text:
         embed.add_field(name="Attachments", value=truncate_text(attachments_text, 1000), inline=False)
@@ -2173,6 +2192,7 @@ class LabelUtilsClient(discord.Client):
         self.add_view(DecisionButtonsView())
         self.add_view(SubmitPanelView())
         self.add_view(SupportTicketPanelView())
+        self.add_view(SupportTicketButtonsView())
         command_names = ", ".join(command.name for command in tree.get_commands())
         logger.info("Registering slash command(s): %s", command_names)
         if DISCORD_GUILD_ID:
@@ -2402,6 +2422,89 @@ class DecisionButtonsView(discord.ui.View):
             return
 
         await interaction.response.send_modal(StaffDmModal(interaction.message))
+
+
+class SupportTicketDmModal(discord.ui.Modal, title="DM Ticket User"):
+    message = discord.ui.TextInput(
+        label="Message",
+        placeholder="Write the message to send to the ticket opener.",
+        style=discord.TextStyle.paragraph,
+        max_length=1500,
+        required=True,
+    )
+
+    def __init__(self, ticket_message: discord.Message):
+        super().__init__()
+        self.ticket_message = ticket_message
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        ticket_id, user_id, subject = support_ticket_info_from_message(self.ticket_message)
+        content = (
+            f"Message from **{server_display_name(interaction)}** about your ticket "
+            f"**{subject}** (`{ticket_id}`):\n\n{self.message.value}\n\n"
+            "To reply to staff, use Discord's Reply action on this message."
+        )
+        dm_message = await dm_artist_text(user_id, content)
+        thread_id = submission_thread_id_from_message(self.ticket_message)
+        route_saved = (
+            save_dm_route(dm_message.id, interaction.guild_id, ticket_id, thread_id, user_id)
+            if dm_message and interaction.guild_id and thread_id
+            else False
+        )
+        await log_submission_thread(
+            self.ticket_message,
+            (
+                f"Ticket log: staff DM attempted by {interaction.user.mention}.\n"
+                f"DM status: {'sent' if dm_message else 'failed'}\n"
+                f"Reply route: {'enabled' if route_saved else 'not enabled'}\n"
+                f"Message: {truncate_text(self.message.value, 1200)}"
+            ),
+        )
+        await interaction.followup.send(
+            "DM sent. User replies will appear in this ticket thread."
+            if dm_message and route_saved
+            else "Could not fully enable the DM route. Check that the user allows DMs and the ticket has a thread.",
+            ephemeral=True,
+        )
+
+
+class SupportTicketButtonsView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Resolved", style=discord.ButtonStyle.green, custom_id="support_ticket:resolve")
+    async def resolve_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not user_can_manage_submissions(interaction):
+            await interaction.response.send_message("You do not have permission to use this.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        ticket_id, _user_id, _subject = support_ticket_info_from_message(interaction.message)
+        database_url = get_guild_database_url(interaction.guild_id)
+        updated = update_support_ticket_status(database_url, ticket_id, "Resolved")
+        if updated and interaction.message.embeds:
+            embed = interaction.message.embeds[0]
+            set_embed_field(embed, "Status", "Resolved", inline=True)
+            embed.color = 0x43B581
+            embed.set_footer(text=f"Resolved by @{interaction.user.name}")
+            await interaction.message.edit(embed=embed, view=self)
+            await log_submission_thread(
+                interaction.message,
+                f"Ticket log: resolved by {interaction.user.mention}.",
+            )
+        await interaction.followup.send(
+            f"`{ticket_id}` marked resolved." if updated else f"Could not resolve `{ticket_id}`.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="DM", style=discord.ButtonStyle.blurple, custom_id="support_ticket:dm")
+    async def dm_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not user_can_manage_submissions(interaction):
+            await interaction.response.send_message("You do not have permission to use this.", ephemeral=True)
+            return
+
+        await interaction.response.send_modal(SupportTicketDmModal(interaction.message))
 
 
 def panel_embed(
@@ -2957,7 +3060,7 @@ async def help_command(interaction: discord.Interaction):
             "`/brand`, `/templates`, `/limits`, `/routing` - customize workflows\n"
             "`/shortlist`, `/priority`, `/rate`, `/reasons`, `/digest` - A&R tools\n"
             "`/storage` - choose West US, Europe (UK), or South-East Asia storage\n"
-            "`/ticket_panel`, `/tickets`, `/ticket_set` - support tickets"
+            "`/ticket_channel`, `/ticket_panel`, `/tickets`, `/ticket_set` - support tickets"
         ),
         inline=False,
     )
@@ -2999,12 +3102,13 @@ class SupportTicketModal(discord.ui.Modal, title="Open Ticket"):
             await interaction.followup.send("I could not reach this server's database.", ephemeral=True)
             return
 
-        channel_id = get_guild_staff_channel_id(interaction.guild_id)
+        settings = get_pro_settings(interaction.guild_id)
+        channel_id = int(settings.get("ticket_channel_id") or 0) or get_guild_staff_channel_id(interaction.guild_id)
         channel = client.get_channel(channel_id)
         if not channel and interaction.guild:
             channel = interaction.guild.get_channel(channel_id)
         if not isinstance(channel, discord.TextChannel):
-            await interaction.followup.send("This server has not connected a staff channel yet.", ephemeral=True)
+            await interaction.followup.send("This server has not connected a ticket channel yet.", ephemeral=True)
             return
 
         ticket_id = generate_support_ticket_id()
@@ -3029,17 +3133,18 @@ class SupportTicketModal(discord.ui.Modal, title="Open Ticket"):
         embed.add_field(name="Ticket ID", value=ticket_id, inline=False)
         embed.add_field(name="User ID", value=str(interaction.user.id), inline=False)
         embed.add_field(name="User", value=interaction.user.mention, inline=True)
+        embed.add_field(name="Subject", value=truncate_text(self.subject.value, 180), inline=False)
         embed.add_field(name="Status", value="Open", inline=True)
         embed.add_field(name="Details", value=truncate_text(self.message.value, 1000), inline=False)
-        staff_message = await channel.send(embed=embed)
+        staff_message = await channel.send(embed=embed, view=SupportTicketButtonsView())
         thread = await create_submission_thread(staff_message, ticket_id, self.subject.value, interaction.user.id)
         if thread:
             set_support_ticket_thread(database_url, ticket_id, thread.id)
             embed.add_field(name="Thread ID", value=str(thread.id), inline=False)
-            await staff_message.edit(embed=embed)
+            await staff_message.edit(embed=embed, view=SupportTicketButtonsView())
             await thread.send(f"Support ticket `{ticket_id}` opened by {interaction.user.mention}.")
 
-        await interaction.followup.send(f"Ticket opened: `{ticket_id}`", ephemeral=True)
+        await interaction.followup.send(f"Ticket opened: `{ticket_id}`. Staff will contact you by DM if needed.", ephemeral=True)
 
 
 class SupportTicketPanelView(discord.ui.View):
@@ -3262,6 +3367,11 @@ async def setup_status(interaction: discord.Interaction):
         database_status_text = "Not connected"
     premium = get_premium_guild(interaction.guild_id)
     premium_status = f"{premium[0]} until {discord_timestamp(premium[1])}" if premium else "Not active"
+    pro_settings = get_pro_settings(interaction.guild_id)
+    ticket_channel_id = int(pro_settings.get("ticket_channel_id") or 0)
+    ticket_channel = client.get_channel(ticket_channel_id) if ticket_channel_id else None
+    if not ticket_channel and interaction.guild and ticket_channel_id:
+        ticket_channel = interaction.guild.get_channel(ticket_channel_id)
     brand = get_guild_brand(interaction.guild_id)
     if brand:
         brand_name = brand.get("display_name") or server_display_name(interaction)
@@ -3289,6 +3399,15 @@ async def setup_status(interaction: discord.Interaction):
     embed.add_field(name="Premium", value=premium_status, inline=True)
     embed.add_field(name="Branding", value=brand_status, inline=False)
     embed.add_field(name="Staff Channel", value=staff_status, inline=False)
+    embed.add_field(
+        name="Ticket Channel",
+        value=(
+            ticket_channel.mention
+            if isinstance(ticket_channel, discord.TextChannel)
+            else "Not set" if ticket_channel_id == 0 else f"Set to `{ticket_channel_id}`, but inaccessible"
+        ),
+        inline=False,
+    )
     embed.add_field(name="Submission Threads", value=thread_status, inline=False)
     embed.set_footer(text="Run /start and /setup_staff to complete setup. Pro can use /storage or /setup_db.")
     await interaction.followup.send(embed=embed, ephemeral=True)
@@ -4063,6 +4182,22 @@ async def ticket_panel(interaction: discord.Interaction, channel: discord.TextCh
     await interaction.response.send_message(f"Ticket panel posted in {channel.mention}.", ephemeral=True)
 
 
+@tree.command(name="ticket_channel", description="Pro admin: set the private staff ticket channel")
+@app_commands.describe(channel="Private staff channel where ticket cards should be posted")
+async def ticket_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    logger.info("Received /ticket_channel from guild=%s user=%s channel=%s.", interaction.guild_id, interaction.user.id, channel.id)
+    error = require_pro_admin(interaction)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+
+    saved = upsert_pro_settings(interaction.guild_id, interaction.user.id, ticket_channel_id=channel.id)
+    await interaction.response.send_message(
+        f"Ticket channel set to {channel.mention}." if saved else "I could not save the ticket channel.",
+        ephemeral=True,
+    )
+
+
 @tree.command(name="tickets", description="Pro staff: show recent support tickets")
 @app_commands.describe(status="Optional ticket status filter")
 @app_commands.choices(
@@ -4070,7 +4205,7 @@ async def ticket_panel(interaction: discord.Interaction, channel: discord.TextCh
         app_commands.Choice(name="Open", value="Open"),
         app_commands.Choice(name="Waiting", value="Waiting"),
         app_commands.Choice(name="Answered", value="Answered"),
-        app_commands.Choice(name="Closed", value="Closed"),
+        app_commands.Choice(name="Resolved", value="Resolved"),
     ]
 )
 async def tickets(interaction: discord.Interaction, status: str = ""):
@@ -4105,7 +4240,7 @@ async def tickets(interaction: discord.Interaction, status: str = ""):
         app_commands.Choice(name="Open", value="Open"),
         app_commands.Choice(name="Waiting", value="Waiting"),
         app_commands.Choice(name="Answered", value="Answered"),
-        app_commands.Choice(name="Closed", value="Closed"),
+        app_commands.Choice(name="Resolved", value="Resolved"),
     ]
 )
 async def ticket_status(

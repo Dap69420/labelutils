@@ -69,7 +69,9 @@ Premium is manually managed through the control database:
 - `/shortlist`, `/shortlisted`, `/priority`, and `/rate` add A&R workflow tools for Pro servers.
 - `/reasons` stores common rejection reasons for staff.
 - `/digest` posts a weekly submission digest to a chosen channel.
-- `/ticket_panel`, `/tickets`, and `/ticket_set` add a normal ticket-tool style support workflow with separate support ticket statuses.
+- `/ticket_channel` chooses the private staff channel where support ticket cards are posted.
+- `/ticket_panel` posts the public button panel users click to open tickets.
+- `/tickets` and `/ticket_set` manage support tickets with separate statuses. Ticket cards have Resolved and DM buttons; DM replies are routed back into the ticket thread.
 - `/analytics` shows submission analytics.
 - `/export` exports a CSV.
 - Artist replies to staff DMs are forwarded into the submission's staff thread. Attachments are forwarded as Discord attachment links, so the bot does not download/reupload files into memory.
