@@ -35,33 +35,37 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 
 After the bot is running, a server administrator should run:
 
-- `/setup_database` to paste that server's Neon PostgreSQL URL. LabelUtils tests the connection, creates the submissions, branding, and Pro settings tables if needed, then stores the URL encrypted in the bot-owner control database.
-- `/setup_staff_channel` to choose where new submissions are sent for that server.
-- `/setup_status` to verify the server database, staff channel, and required bot-owner config.
+- `/setup_db` to paste that server's Neon PostgreSQL URL. LabelUtils tests the connection, creates the submissions, tickets, branding, and Pro settings tables if needed, then stores the URL encrypted in the bot-owner control database.
+- `/setup_staff` to choose where new submissions and tickets are sent for that server.
+- `/setup` to verify the server database, staff channel, and required bot-owner config.
 
-Users can run `/help` for the command list, `/ticket` to check one ticket, `/my_submissions` or `/my_demos` to see their own ticket history, and `/my_stats` to see submitted/accepted counts. `/accepted_leaderboard` shows a paginated leaderboard of Discord submitters with the most accepted demos. New submissions are checked for duplicate demo links and each staff submission card opens a staff discussion thread when the bot has thread permissions.
+Users can run `/help` for the command list, `/submission` to check one label submission, `/my_subs` or `/my_demos` to see their own ticket history, and `/my_stats` to see submitted/accepted counts. `/leaderboard` shows a paginated leaderboard of Discord submitters with the most accepted demos. New submissions are checked for duplicate demo links and each staff submission card opens a staff discussion thread when the bot has thread permissions.
 
 Premium is manually managed through the control database:
 
 - `/premium` shows users how to contact you to buy premium.
-- `/premium_status` checks the current server's premium state.
-- `/premium_redeem` lets a server administrator redeem a premium coupon for the current server.
-- `/premium_coupon_create` creates a reusable premium coupon with a configurable use count. Owner-only via `OWNER_USER_IDS`.
-- `/premium_add` grants premium to a server. Owner-only via `OWNER_USER_IDS`.
-- `/premium_remove` removes premium from a server. Owner-only via `OWNER_USER_IDS`.
-- `/setup_brand` opens a form where Pro servers customize the display name, embed color, and submit panel caption used in supported server-specific messages.
-- `/brand_status` shows the active brand settings.
-- `/brand_reset` resets branding to server defaults.
-- `/setup_form` customizes the optional submission prompt.
-- `/setup_templates` opens a form for approval/rejection DMs. Either field can be left blank to keep the current template.
-- `/setup_limits` configures cooldowns, submission caps, and duplicate-link policy.
-- `/setup_routing` routes approved/rejected updates to separate channels.
-- `/setup_brand_extras` sets footer text, logo thumbnail, and custom success message.
-- `/post_submit_panel` posts a branded submit button panel.
-- `/staff_note` adds private staff notes to tickets.
-- `/assign_reviewer` assigns staff reviewers to tickets.
+- `/pro_status` checks the current server's premium state.
+- `/redeem` lets a server administrator redeem a premium coupon for the current server.
+- `/coupon` creates a reusable premium coupon with a configurable use count. Owner-only via `OWNER_USER_IDS`.
+- `/pro_add` grants premium to a server. Owner-only via `OWNER_USER_IDS`.
+- `/pro_remove` removes premium from a server. Owner-only via `OWNER_USER_IDS`.
+- `/brand` opens a form where Pro servers customize the display name, embed color, and submit panel caption used in supported server-specific messages.
+- `/brand_info` shows the active brand settings.
+- `/brand_clear` resets branding to server defaults.
+- `/form` customizes the optional submission prompt.
+- `/templates` opens a form for approval/rejection DMs. Either field can be left blank to keep the current template.
+- `/limits` configures cooldowns, submission caps, and duplicate-link policy.
+- `/routing` routes approved/rejected updates to separate channels.
+- `/extras` sets footer text, logo thumbnail, and custom success message.
+- `/post_panel` posts a branded submit button panel.
+- `/note` adds private staff notes to submissions.
+- `/reviewer` assigns staff reviewers to submissions.
+- `/shortlist`, `/shortlisted`, `/priority`, and `/rate` add A&R workflow tools for Pro servers.
+- `/reasons` stores common rejection reasons for staff.
+- `/digest` posts a weekly submission digest to a chosen channel.
+- `/ticket_panel`, `/tickets`, and `/ticket_set` add a normal ticket-tool style support workflow with separate support ticket statuses.
 - `/analytics` shows submission analytics.
-- `/export_submissions` exports a CSV.
+- `/export` exports a CSV.
 - Artist replies to staff DMs are forwarded into the submission's staff thread. Attachments are forwarded as Discord attachment links, so the bot does not download/reupload files into memory.
 
 Each server's submissions, Pro branding, and Pro settings are stored in that server's configured Neon database. The owner control database only stores the encrypted server database link, staff-channel setup, and premium status.
@@ -70,7 +74,7 @@ Submission threads also receive release logs for submission creation, approval, 
 Visible submission and premium dates use Discord native timestamps, so Discord renders them in each user's local timezone.
 Discord modals support a maximum of five text inputs, so LabelUtils keeps the five core submission fields and Pro form customization currently changes the optional message field's label and placeholder.
 
-Discord does not support changing a bot's actual avatar or online presence separately per server. Pro branding is server-specific inside LabelUtils messages and embeds, and `/setup_brand` also tries to update the bot's server nickname when Discord permissions allow it.
+Discord does not support changing a bot's actual avatar or online presence separately per server. Pro branding is server-specific inside LabelUtils messages and embeds, and `/brand` also tries to update the bot's server nickname when Discord permissions allow it.
 
 The app exposes a small health endpoint on `/` and `/health` while the Discord bot runs in the same process.
 

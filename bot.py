@@ -62,6 +62,16 @@ guild_staff_channel_cache: dict[int, int] = {}
 guild_brand_cache: dict[int, dict[str, object] | None] = {}
 guild_pro_settings_cache: dict[int, dict[str, object]] = {}
 
+LABEL_STATUSES = [
+    "In Queue",
+    "Needs Review",
+    "Shortlisted",
+    "Contacted",
+    "Signed",
+    "Approved",
+    "Rejected",
+]
+TICKET_STATUSES = ["Open", "Waiting", "Answered", "Closed"]
 
 SUBMISSIONS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS label_submissions (
@@ -75,8 +85,25 @@ CREATE TABLE IF NOT EXISTS label_submissions (
     message TEXT NOT NULL,
     staff_notes TEXT NOT NULL DEFAULT '',
     reviewer_id BIGINT,
+    rating INTEGER,
+    shortlisted BOOLEAN NOT NULL DEFAULT FALSE,
+    priority BOOLEAN NOT NULL DEFAULT FALSE,
     status TEXT NOT NULL DEFAULT 'In Queue',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"""
+
+SUPPORT_TICKETS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS labelutils_support_tickets (
+    ticket_id TEXT PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    username TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    message TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'Open',
+    thread_id BIGINT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 """
 
@@ -106,6 +133,8 @@ CREATE TABLE IF NOT EXISTS labelutils_pro_settings (
     footer_text TEXT,
     logo_url TEXT,
     success_message TEXT,
+    rejection_reasons TEXT,
+    digest_channel_id BIGINT,
     updated_by BIGINT NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -120,6 +149,11 @@ def generate_ticket_id() -> str:
     part1 = "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
     part2 = "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
     return f"LABEL-{part1}-{part2}"
+
+
+def generate_support_ticket_id() -> str:
+    part = "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
+    return f"TICKET-{part}"
 
 
 def is_valid_url(value: str) -> bool:
@@ -320,6 +354,7 @@ def ensure_submission_table(database_url: str) -> bool:
         with connect_db(database_url) as conn:
             with conn.cursor() as cur:
                 cur.execute(SUBMISSIONS_TABLE_SQL)
+                cur.execute(SUPPORT_TICKETS_TABLE_SQL)
                 cur.execute(GUILD_BRANDING_TABLE_SQL)
                 cur.execute(PRO_SETTINGS_TABLE_SQL)
                 cur.execute(
@@ -332,7 +367,17 @@ def ensure_submission_table(database_url: str) -> bool:
                     """
                     ALTER TABLE label_submissions
                     ADD COLUMN IF NOT EXISTS staff_notes TEXT NOT NULL DEFAULT '',
-                    ADD COLUMN IF NOT EXISTS reviewer_id BIGINT;
+                    ADD COLUMN IF NOT EXISTS reviewer_id BIGINT,
+                    ADD COLUMN IF NOT EXISTS rating INTEGER,
+                    ADD COLUMN IF NOT EXISTS shortlisted BOOLEAN NOT NULL DEFAULT FALSE,
+                    ADD COLUMN IF NOT EXISTS priority BOOLEAN NOT NULL DEFAULT FALSE;
+                    """
+                )
+                cur.execute(
+                    """
+                    ALTER TABLE labelutils_pro_settings
+                    ADD COLUMN IF NOT EXISTS rejection_reasons TEXT,
+                    ADD COLUMN IF NOT EXISTS digest_channel_id BIGINT;
                     """
                 )
                 cur.execute(
@@ -902,6 +947,8 @@ DEFAULT_PRO_SETTINGS: dict[str, object] = {
     "footer_text": "",
     "logo_url": "",
     "success_message": "Complete! Your submission has been logged. Ticket ID: `{ticket_id}`",
+    "rejection_reasons": "",
+    "digest_channel_id": 0,
 }
 
 
@@ -909,7 +956,7 @@ PRO_SETTINGS_KEYS = [
     "message_label", "message_placeholder", "approval_template", "rejection_template",
     "cooldown_minutes", "max_submissions_per_user", "duplicate_policy",
     "approved_channel_id", "rejected_channel_id", "footer_text", "logo_url",
-    "success_message",
+    "success_message", "rejection_reasons", "digest_channel_id",
 ]
 
 
@@ -939,7 +986,8 @@ def fetch_legacy_pro_settings(guild_id: int) -> dict[str, object]:
         logger.exception("Failed to fetch legacy Pro settings for guild %s.", guild_id)
         return {}
 
-    return {key: value for key, value in zip(PRO_SETTINGS_KEYS, row or []) if value not in {None, ""}}
+    legacy_keys = PRO_SETTINGS_KEYS[:12]
+    return {key: value for key, value in zip(legacy_keys, row or []) if value not in {None, ""}}
 
 
 def get_pro_settings(guild_id: int | None) -> dict[str, object]:
@@ -963,7 +1011,7 @@ def get_pro_settings(guild_id: int | None) -> dict[str, object]:
                         message_label, message_placeholder, approval_template, rejection_template,
                         cooldown_minutes, max_submissions_per_user, duplicate_policy,
                         approved_channel_id, rejected_channel_id, footer_text, logo_url,
-                        success_message
+                        success_message, rejection_reasons, digest_channel_id
                     FROM labelutils_pro_settings
                     WHERE guild_id = %s;
                     """,
@@ -999,7 +1047,7 @@ def upsert_pro_settings(guild_id: int, updated_by: int, **values: object) -> boo
         "message_label", "message_placeholder", "approval_template", "rejection_template",
         "cooldown_minutes", "max_submissions_per_user", "duplicate_policy",
         "approved_channel_id", "rejected_channel_id", "footer_text", "logo_url",
-        "success_message",
+        "success_message", "rejection_reasons", "digest_channel_id",
     }
     updates = {key: value for key, value in values.items() if key in allowed}
     if not updates:
@@ -1045,6 +1093,12 @@ def format_rejection_template(template: object, reason: str, **values: object) -
     if "{reason}" not in str(template) and reason.strip():
         text = f"{text}\n\nReason: {reason.strip()}"
     return text
+
+
+def parse_rejection_reasons(settings: dict[str, object]) -> list[str]:
+    raw = str(settings.get("rejection_reasons") or "")
+    reasons = [reason.strip() for reason in raw.split("|") if reason.strip()]
+    return reasons[:10]
 
 
 def save_submission_to_neon(
@@ -1154,7 +1208,8 @@ def fetch_submission_by_ticket(database_url: str | None, ticket_id: str) -> tupl
                     """
                     SELECT
                         ticket_id, user_id, name, discord_username, track_name, track_link,
-                        artist_names, message, status, created_at, reviewer_id, staff_notes
+                        artist_names, message, status, created_at, reviewer_id, staff_notes,
+                        rating, shortlisted, priority
                     FROM label_submissions
                     WHERE upper(ticket_id) = %s;
                     """,
@@ -1164,6 +1219,104 @@ def fetch_submission_by_ticket(database_url: str | None, ticket_id: str) -> tupl
     except Exception:
         logger.exception("Failed to fetch submission ticket %s.", normalized_ticket_id)
         return None
+
+
+def update_submission_flags(
+    database_url: str | None,
+    ticket_id: str,
+    *,
+    shortlisted: bool | None = None,
+    priority: bool | None = None,
+    rating: int | None = None,
+) -> bool:
+    if not database_url:
+        return False
+
+    normalized_ticket_id = normalize_ticket_id(ticket_id)
+    updates = {}
+    if shortlisted is not None:
+        updates["shortlisted"] = shortlisted
+    if priority is not None:
+        updates["priority"] = priority
+    if rating is not None:
+        updates["rating"] = max(1, min(rating, 10))
+    if not updates:
+        return True
+
+    set_sql = ", ".join(f"{column} = %s" for column in updates)
+    params = [*updates.values(), normalized_ticket_id]
+    try:
+        with connect_db(database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE label_submissions SET {set_sql} WHERE upper(ticket_id) = %s;",
+                    params,
+                )
+                return cur.rowcount > 0
+    except Exception:
+        logger.exception("Failed to update workflow flags for %s.", normalized_ticket_id)
+        return False
+
+
+def fetch_shortlisted_submissions(database_url: str | None, limit: int = 10) -> list[tuple]:
+    if not database_url:
+        return []
+
+    try:
+        with connect_db(database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT ticket_id, name, track_name, status, created_at
+                    FROM label_submissions
+                    WHERE shortlisted = TRUE
+                    ORDER BY priority DESC, rating DESC NULLS LAST, created_at DESC
+                    LIMIT %s;
+                    """,
+                    (limit,),
+                )
+                return cur.fetchall()
+    except Exception:
+        logger.exception("Failed to fetch shortlisted submissions.")
+        return []
+
+
+def fetch_weekly_digest_stats(database_url: str | None) -> dict[str, int | float]:
+    if not database_url:
+        return {}
+
+    try:
+        with connect_db(database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days'),
+                        COUNT(*) FILTER (WHERE lower(status) = 'approved' AND created_at >= NOW() - INTERVAL '7 days'),
+                        COUNT(*) FILTER (WHERE lower(status) = 'rejected' AND created_at >= NOW() - INTERVAL '7 days'),
+                        COUNT(*) FILTER (WHERE lower(status) IN ('in queue', 'needs review', 'shortlisted')),
+                        COUNT(*) FILTER (WHERE shortlisted = TRUE),
+                        COUNT(*) FILTER (WHERE priority = TRUE),
+                        ROUND(AVG(rating)::numeric, 1)
+                    FROM label_submissions;
+                    """
+                )
+                row = cur.fetchone()
+    except Exception:
+        logger.exception("Failed to fetch weekly digest stats.")
+        return {}
+
+    if not row:
+        return {}
+    return {
+        "new": int(row[0] or 0),
+        "approved": int(row[1] or 0),
+        "rejected": int(row[2] or 0),
+        "pending": int(row[3] or 0),
+        "shortlisted": int(row[4] or 0),
+        "priority": int(row[5] or 0),
+        "avg_rating": float(row[6] or 0),
+    }
 
 
 def fetch_user_submission_stats(database_url: str | None, user_id: int) -> tuple[int, int, int, int]:
@@ -1276,7 +1429,8 @@ def fetch_submissions_for_export(database_url: str | None) -> list[tuple]:
                     """
                     SELECT
                         ticket_id, user_id, name, discord_username, track_name, track_link,
-                        artist_names, message, status, created_at, reviewer_id, staff_notes
+                        artist_names, message, status, created_at, reviewer_id, staff_notes,
+                        rating, shortlisted, priority
                     FROM label_submissions
                     ORDER BY created_at DESC;
                     """
@@ -1374,7 +1528,7 @@ def fetch_submissions(database_url: str | None, status: str | None = None, limit
                         SELECT ticket_id, name, track_name, status, created_at
                         FROM label_submissions
                         WHERE status = %s
-                        ORDER BY created_at DESC
+                        ORDER BY priority DESC, created_at DESC
                         LIMIT %s;
                         """,
                         (status, limit),
@@ -1384,7 +1538,7 @@ def fetch_submissions(database_url: str | None, status: str | None = None, limit
                         """
                         SELECT ticket_id, name, track_name, status, created_at
                         FROM label_submissions
-                        ORDER BY created_at DESC
+                        ORDER BY priority DESC, created_at DESC
                         LIMIT %s;
                         """,
                         (limit,),
@@ -1406,6 +1560,7 @@ def fetch_panel_submissions(
         return []
 
     order_direction = "ASC" if sort_order == "oldest" else "DESC"
+    order_sql = f"priority DESC, created_at {order_direction}"
 
     try:
         with connect_db(database_url) as conn:
@@ -1418,7 +1573,7 @@ def fetch_panel_submissions(
                             artist_names, message, status, created_at
                         FROM label_submissions
                         WHERE status = %s
-                        ORDER BY created_at {order_direction}
+                        ORDER BY {order_sql}
                         LIMIT %s OFFSET %s;
                         """,
                         (status, limit, offset),
@@ -1430,7 +1585,7 @@ def fetch_panel_submissions(
                             ticket_id, name, discord_username, track_name, track_link,
                             artist_names, message, status, created_at
                         FROM label_submissions
-                        ORDER BY created_at {order_direction}
+                        ORDER BY {order_sql}
                         LIMIT %s OFFSET %s;
                         """,
                         (limit, offset),
@@ -1460,6 +1615,113 @@ def count_submissions(database_url: str | None, status: str | None = None) -> in
     except Exception:
         logger.exception("Failed to count submissions.")
         return 0
+
+
+def create_support_ticket(
+    database_url: str | None,
+    ticket_id: str,
+    user_id: int,
+    username: str,
+    subject: str,
+    message: str,
+) -> bool:
+    if not database_url:
+        return False
+
+    try:
+        with connect_db(database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO labelutils_support_tickets (
+                        ticket_id, user_id, username, subject, message, status, created_at, updated_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, 'Open', NOW(), NOW()
+                    );
+                    """,
+                    (ticket_id, user_id, username, subject, message),
+                )
+        return True
+    except Exception:
+        logger.exception("Failed to create support ticket %s.", ticket_id)
+        return False
+
+
+def set_support_ticket_thread(database_url: str | None, ticket_id: str, thread_id: int) -> bool:
+    if not database_url:
+        return False
+
+    try:
+        with connect_db(database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE labelutils_support_tickets
+                    SET thread_id = %s, updated_at = NOW()
+                    WHERE ticket_id = %s;
+                    """,
+                    (thread_id, ticket_id),
+                )
+                return cur.rowcount > 0
+    except Exception:
+        logger.exception("Failed to save support ticket thread for %s.", ticket_id)
+        return False
+
+
+def update_support_ticket_status(database_url: str | None, ticket_id: str, status: str) -> bool:
+    if not database_url:
+        return False
+
+    normalized_ticket_id = normalize_ticket_id(ticket_id)
+    try:
+        with connect_db(database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE labelutils_support_tickets
+                    SET status = %s, updated_at = NOW()
+                    WHERE upper(ticket_id) = %s;
+                    """,
+                    (status, normalized_ticket_id),
+                )
+                return cur.rowcount > 0
+    except Exception:
+        logger.exception("Failed to update support ticket %s.", normalized_ticket_id)
+        return False
+
+
+def fetch_support_tickets(database_url: str | None, status: str | None = None, limit: int = 10) -> list[tuple]:
+    if not database_url:
+        return []
+
+    try:
+        with connect_db(database_url) as conn:
+            with conn.cursor() as cur:
+                if status:
+                    cur.execute(
+                        """
+                        SELECT ticket_id, username, subject, status, created_at
+                        FROM labelutils_support_tickets
+                        WHERE status = %s
+                        ORDER BY created_at DESC
+                        LIMIT %s;
+                        """,
+                        (status, limit),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT ticket_id, username, subject, status, created_at
+                        FROM labelutils_support_tickets
+                        ORDER BY created_at DESC
+                        LIMIT %s;
+                        """,
+                        (limit,),
+                    )
+                return cur.fetchall()
+    except Exception:
+        logger.exception("Failed to fetch support tickets.")
+        return []
 
 
 def embed_field(embed: discord.Embed, name: str, default: str = "") -> str:
@@ -1725,6 +1987,7 @@ class LabelUtilsClient(discord.Client):
     async def setup_hook(self) -> None:
         self.add_view(DecisionButtonsView())
         self.add_view(SubmitPanelView())
+        self.add_view(SupportTicketPanelView())
         command_names = ", ".join(command.name for command in tree.get_commands())
         logger.info("Registering slash command(s): %s", command_names)
         if DISCORD_GUILD_ID:
@@ -1772,9 +2035,16 @@ class RejectReasonModal(discord.ui.Modal, title="Reject Submission"):
         required=True,
     )
 
-    def __init__(self, staff_message: discord.Message):
+    def __init__(self, staff_message: discord.Message, guild_id: int | None = None):
         super().__init__()
         self.staff_message = staff_message
+        self.saved_reasons = parse_rejection_reasons(get_pro_settings(guild_id))
+        if self.saved_reasons:
+            preview = "; ".join(f"{index}. {reason}" for index, reason in enumerate(self.saved_reasons[:3], start=1))
+            self.reason.placeholder = truncate_text(
+                f"Type 1-{len(self.saved_reasons)} for saved reason, or write custom. {preview}",
+                100,
+            )
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -1783,12 +2053,17 @@ class RejectReasonModal(discord.ui.Modal, title="Reject Submission"):
         settings = get_pro_settings(interaction.guild_id)
         database_url = get_guild_database_url(interaction.guild_id)
         db_updated = update_submission_status(database_url, ticket_id, "Rejected")
+        reason_text = self.reason.value.strip()
+        if reason_text.isdigit():
+            reason_index = int(reason_text) - 1
+            if 0 <= reason_index < len(self.saved_reasons):
+                reason_text = self.saved_reasons[reason_index]
 
         dm_embed = discord.Embed(
             title="Submission Update",
             description=format_rejection_template(
                 settings.get("rejection_template"),
-                reason=self.reason.value,
+                reason=reason_text,
                 track_name=track_name,
                 team_name=team_name,
                 ticket_id=ticket_id,
@@ -1803,7 +2078,7 @@ class RejectReasonModal(discord.ui.Modal, title="Reject Submission"):
         disable_view_items(view)
         old_embed = self.staff_message.embeds[0]
         old_embed.color = 0xF04747
-        old_embed.add_field(name="Rejection Reason", value=self.reason.value, inline=False)
+        old_embed.add_field(name="Rejection Reason", value=reason_text, inline=False)
         old_embed.set_footer(
             text=f"Rejected by @{interaction.user.name} | {dm_status} | {db_status}"
         )
@@ -1814,7 +2089,7 @@ class RejectReasonModal(discord.ui.Modal, title="Reject Submission"):
             self.staff_message,
             (
                 f"Release log: rejected by {interaction.user.mention}.\n"
-                f"Reason: {self.reason.value}\n"
+                f"Reason: {reason_text}\n"
                 f"{dm_status} | {db_status}"
             ),
         )
@@ -1933,7 +2208,7 @@ class DecisionButtonsView(discord.ui.View):
             await interaction.response.send_message("You do not have permission to use this.", ephemeral=True)
             return
 
-        await interaction.response.send_modal(RejectReasonModal(interaction.message))
+        await interaction.response.send_modal(RejectReasonModal(interaction.message, interaction.guild_id))
 
     @discord.ui.button(label="DM", style=discord.ButtonStyle.blurple, custom_id="submission:dm")
     async def dm_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2321,14 +2596,14 @@ class AdvancedSubmissionModal(discord.ui.Modal, title="New Label Submission"):
         database_url = get_guild_database_url(interaction.guild_id)
         if not database_url:
             await interaction.response.send_message(
-                "This server has not connected a Neon database yet. Ask an admin to run `/setup_database`.",
+                "This server has not connected a Neon database yet. Ask an admin to run `/setup_db`.",
                 ephemeral=True,
             )
             return
         staff_channel_id = get_guild_staff_channel_id(interaction.guild_id)
         if staff_channel_id == 0:
             await interaction.response.send_message(
-                "This server has not set a staff channel yet. Ask an admin to run `/setup_staff_channel`.",
+                "This server has not set a staff channel yet. Ask an admin to run `/setup_staff`.",
                 ephemeral=True,
             )
             return
@@ -2467,10 +2742,10 @@ async def help_command(interaction: discord.Interaction):
         name="For Artists",
         value=(
             "`/submit` - send a demo\n"
-            "`/ticket` - check a ticket\n"
-            "`/my_submissions` - view your submissions\n"
+            "`/submission` - check a submission\n"
+            "`/my_subs` - view your submissions\n"
             "`/my_stats` - view your acceptance stats\n"
-            "`/accepted_leaderboard` - see accepted submitters"
+            "`/leaderboard` - see accepted submitters"
         ),
         inline=False,
     )
@@ -2479,17 +2754,17 @@ async def help_command(interaction: discord.Interaction):
         value=(
             "`/queue`, `/recent`, `/panel` - browse submissions\n"
             "`/status` - update a ticket\n"
-            "`/setup_database`, `/setup_staff_channel`, `/setup_status` - setup"
+            "`/setup_db`, `/setup_staff`, `/setup` - setup"
         ),
         inline=False,
     )
     embed.add_field(
         name="Pro",
         value=(
-            "`/premium` and `/premium_redeem` - upgrade this server\n"
-            "`/setup_brand`, `/setup_templates`, `/setup_limits`, `/setup_routing` - customize workflows\n"
-            "`/staff_note`, `/assign_reviewer`, `/analytics`, `/export_submissions` - staff tools\n"
-            "Artist replies to staff DMs forward into staff threads."
+            "`/premium` and `/redeem` - upgrade this server\n"
+            "`/brand`, `/templates`, `/limits`, `/routing` - customize workflows\n"
+            "`/shortlist`, `/priority`, `/rate`, `/reasons`, `/digest` - A&R tools\n"
+            "`/ticket_panel`, `/tickets`, `/ticket_set` - support tickets"
         ),
         inline=False,
     )
@@ -2506,6 +2781,83 @@ class SubmitPanelView(discord.ui.View):
         await interaction.response.send_modal(AdvancedSubmissionModal(interaction.guild_id))
 
 
+class SupportTicketModal(discord.ui.Modal, title="Open Ticket"):
+    subject = discord.ui.TextInput(
+        label="Subject",
+        placeholder="What do you need help with?",
+        max_length=120,
+        required=True,
+    )
+    message = discord.ui.TextInput(
+        label="Details",
+        placeholder="Share the details staff should know.",
+        style=discord.TextStyle.paragraph,
+        max_length=1500,
+        required=True,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        database_url = get_guild_database_url(interaction.guild_id)
+        if not database_url:
+            await interaction.followup.send("This server has not connected a database yet.", ephemeral=True)
+            return
+        if not ensure_submission_table(database_url):
+            await interaction.followup.send("I could not reach this server's database.", ephemeral=True)
+            return
+
+        channel_id = get_guild_staff_channel_id(interaction.guild_id)
+        channel = client.get_channel(channel_id)
+        if not channel and interaction.guild:
+            channel = interaction.guild.get_channel(channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            await interaction.followup.send("This server has not connected a staff channel yet.", ephemeral=True)
+            return
+
+        ticket_id = generate_support_ticket_id()
+        username = f"@{interaction.user.name}"
+        saved = create_support_ticket(
+            database_url,
+            ticket_id,
+            interaction.user.id,
+            username,
+            self.subject.value,
+            self.message.value,
+        )
+        if not saved:
+            await interaction.followup.send("I could not create that ticket.", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title="New Support Ticket",
+            description=truncate_text(self.subject.value, 180),
+            color=server_embed_color(interaction),
+        )
+        embed.add_field(name="Ticket ID", value=ticket_id, inline=False)
+        embed.add_field(name="User ID", value=str(interaction.user.id), inline=False)
+        embed.add_field(name="User", value=interaction.user.mention, inline=True)
+        embed.add_field(name="Status", value="Open", inline=True)
+        embed.add_field(name="Details", value=truncate_text(self.message.value, 1000), inline=False)
+        staff_message = await channel.send(embed=embed)
+        thread = await create_submission_thread(staff_message, ticket_id, self.subject.value, interaction.user.id)
+        if thread:
+            set_support_ticket_thread(database_url, ticket_id, thread.id)
+            embed.add_field(name="Thread ID", value=str(thread.id), inline=False)
+            await staff_message.edit(embed=embed)
+            await thread.send(f"Support ticket `{ticket_id}` opened by {interaction.user.mention}.")
+
+        await interaction.followup.send(f"Ticket opened: `{ticket_id}`", ephemeral=True)
+
+
+class SupportTicketPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Open Ticket", style=discord.ButtonStyle.green, custom_id="support_ticket:open")
+    async def ticket_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(SupportTicketModal())
+
+
 def require_pro_admin(interaction: discord.Interaction) -> str | None:
     if not user_is_admin(interaction):
         return "Only administrators can use this Pro setup command."
@@ -2514,7 +2866,7 @@ def require_pro_admin(interaction: discord.Interaction) -> str | None:
     return None
 
 
-@tree.command(name="setup_database", description="Admin: connect this server to a Neon database")
+@tree.command(name="setup_db", description="Admin: connect this server to a Neon database")
 async def setup_database(interaction: discord.Interaction):
     logger.info("Received /setup_database from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
     if not user_is_admin(interaction):
@@ -2526,7 +2878,7 @@ async def setup_database(interaction: discord.Interaction):
     await interaction.response.send_modal(DatabaseSetupModal())
 
 
-@tree.command(name="setup_staff_channel", description="Admin: set the staff feed channel for this server")
+@tree.command(name="setup_staff", description="Admin: set the staff feed channel for this server")
 @app_commands.describe(channel="Channel where new submissions should be sent")
 async def setup_staff_channel(interaction: discord.Interaction, channel: discord.TextChannel):
     logger.info(
@@ -2564,7 +2916,7 @@ async def setup_staff_channel(interaction: discord.Interaction, channel: discord
     await interaction.followup.send(text, ephemeral=True)
 
 
-@tree.command(name="database_status", description="Admin: check whether this server has a database connected")
+@tree.command(name="db_status", description="Admin: check whether this server has a database connected")
 async def database_status(interaction: discord.Interaction):
     logger.info("Received /database_status from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
     if not user_is_admin(interaction):
@@ -2579,12 +2931,12 @@ async def database_status(interaction: discord.Interaction):
     text = (
         "This server has a Neon database connected."
         if configured
-        else "No Neon database is connected for this server. Run `/setup_database`."
+        else "No Neon database is connected for this server. Run `/setup_db`."
     )
     await interaction.followup.send(text, ephemeral=True)
 
 
-@tree.command(name="staff_channel_status", description="Admin: check this server's staff feed channel")
+@tree.command(name="staff_status", description="Admin: check this server's staff feed channel")
 async def staff_channel_status(interaction: discord.Interaction):
     logger.info("Received /staff_channel_status from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
     if not user_is_admin(interaction):
@@ -2598,7 +2950,7 @@ async def staff_channel_status(interaction: discord.Interaction):
     channel_id = get_guild_staff_channel_id(interaction.guild_id)
     if channel_id == 0:
         await interaction.followup.send(
-            "No staff channel is connected for this server. Run `/setup_staff_channel`.",
+            "No staff channel is connected for this server. Run `/setup_staff`.",
             ephemeral=True,
         )
         return
@@ -2614,7 +2966,7 @@ async def staff_channel_status(interaction: discord.Interaction):
     await interaction.followup.send(text, ephemeral=True)
 
 
-@tree.command(name="setup_status", description="Admin: check LabelUtils setup for this server")
+@tree.command(name="setup", description="Admin: check LabelUtils setup for this server")
 async def setup_status(interaction: discord.Interaction):
     logger.info("Received /setup_status from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
     if not user_is_admin(interaction):
@@ -2664,7 +3016,7 @@ async def setup_status(interaction: discord.Interaction):
     embed.add_field(name="Branding", value=brand_status, inline=False)
     embed.add_field(name="Staff Channel", value=staff_status, inline=False)
     embed.add_field(name="Submission Threads", value=thread_status, inline=False)
-    embed.set_footer(text="Run /setup_database and /setup_staff_channel to complete setup.")
+    embed.set_footer(text="Run /setup_db and /setup_staff to complete setup.")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -2686,7 +3038,7 @@ async def premium(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@tree.command(name="premium_status", description="Check this server's premium status")
+@tree.command(name="pro_status", description="Check this server's premium status")
 async def premium_status(interaction: discord.Interaction):
     logger.info("Received /premium_status from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
     premium_row = get_premium_guild(interaction.guild_id)
@@ -2698,7 +3050,7 @@ async def premium_status(interaction: discord.Interaction):
     await interaction.response.send_message(text, ephemeral=True)
 
 
-@tree.command(name="premium_redeem", description="Admin: redeem a premium coupon for this server")
+@tree.command(name="redeem", description="Admin: redeem a premium coupon for this server")
 @app_commands.describe(code="Premium coupon code")
 async def premium_redeem(interaction: discord.Interaction, code: str):
     logger.info("Received /premium_redeem from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
@@ -2714,7 +3066,7 @@ async def premium_redeem(interaction: discord.Interaction, code: str):
     await interaction.followup.send(message if redeemed else f"Could not redeem coupon: {message}", ephemeral=True)
 
 
-@tree.command(name="premium_coupon_create", description="Owner: create a reusable premium coupon")
+@tree.command(name="coupon", description="Owner: create a reusable premium coupon")
 @app_commands.describe(
     days="Premium days granted per redemption",
     uses="How many times this coupon can be redeemed",
@@ -2747,7 +3099,7 @@ async def premium_coupon_create(
         await interaction.followup.send(f"Could not create coupon: {result}", ephemeral=True)
 
 
-@tree.command(name="premium_add", description="Owner: manually grant premium to a server")
+@tree.command(name="pro_add", description="Owner: manually grant premium to a server")
 @app_commands.describe(
     guild_id="Discord server ID to grant premium to",
     days="Number of days to add",
@@ -2782,7 +3134,7 @@ async def premium_add(
     await interaction.followup.send(text, ephemeral=True)
 
 
-@tree.command(name="premium_remove", description="Owner: remove premium from a server")
+@tree.command(name="pro_remove", description="Owner: remove premium from a server")
 @app_commands.describe(guild_id="Discord server ID to remove premium from")
 async def premium_remove(interaction: discord.Interaction, guild_id: str):
     logger.info("Received /premium_remove from user=%s for guild=%s.", interaction.user.id, guild_id)
@@ -2860,7 +3212,7 @@ class BrandSetupModal(discord.ui.Modal, title="Setup Pro Branding"):
         await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@tree.command(name="setup_brand", description="Pro: customize this server's LabelUtils branding")
+@tree.command(name="brand", description="Pro: customize this server's LabelUtils branding")
 async def setup_brand(interaction: discord.Interaction):
     logger.info("Received /setup_brand from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
     if not interaction.guild_id:
@@ -2879,7 +3231,7 @@ async def setup_brand(interaction: discord.Interaction):
     await interaction.response.send_modal(BrandSetupModal())
 
 
-@tree.command(name="brand_status", description="Show this server's Pro branding")
+@tree.command(name="brand_info", description="Show this server's Pro branding")
 async def brand_status(interaction: discord.Interaction):
     logger.info("Received /brand_status from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
     await interaction.response.defer(ephemeral=True)
@@ -2906,7 +3258,7 @@ async def brand_status(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@tree.command(name="brand_reset", description="Pro: reset this server's custom branding")
+@tree.command(name="brand_clear", description="Pro: reset this server's custom branding")
 async def brand_reset(interaction: discord.Interaction):
     logger.info("Received /brand_reset from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
     if not interaction.guild_id:
@@ -2931,7 +3283,7 @@ async def brand_reset(interaction: discord.Interaction):
     )
 
 
-@tree.command(name="setup_form", description="Pro: customize the optional submission question")
+@tree.command(name="form", description="Pro: customize the optional submission question")
 @app_commands.describe(
     label="Label for the final optional form field",
     placeholder="Placeholder text for that field",
@@ -2992,7 +3344,7 @@ class TemplateSetupModal(discord.ui.Modal, title="Setup DM Templates"):
         )
 
 
-@tree.command(name="setup_templates", description="Pro: customize approval and rejection DMs")
+@tree.command(name="templates", description="Pro: customize approval and rejection DMs")
 async def setup_templates(interaction: discord.Interaction):
     logger.info("Received /setup_templates from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
     error = require_pro_admin(interaction)
@@ -3003,7 +3355,7 @@ async def setup_templates(interaction: discord.Interaction):
     await interaction.response.send_modal(TemplateSetupModal())
 
 
-@tree.command(name="setup_limits", description="Pro: configure cooldowns, submission caps, and duplicate policy")
+@tree.command(name="limits", description="Pro: configure cooldowns, submission caps, and duplicate policy")
 @app_commands.describe(
     cooldown_minutes="Minutes users must wait between submissions",
     max_submissions_per_user="0 means unlimited total submissions per user",
@@ -3040,7 +3392,7 @@ async def setup_limits(
     )
 
 
-@tree.command(name="setup_routing", description="Pro: route approved/rejected updates to channels")
+@tree.command(name="routing", description="Pro: route approved/rejected updates to channels")
 @app_commands.describe(
     approved_channel="Optional channel for approved submission updates",
     rejected_channel="Optional channel for rejected submission updates",
@@ -3068,7 +3420,7 @@ async def setup_routing(
     )
 
 
-@tree.command(name="setup_brand_extras", description="Pro: set footer, logo, and submit success text")
+@tree.command(name="extras", description="Pro: set footer, logo, and submit success text")
 @app_commands.describe(
     footer_text="Footer prefix on staff submission cards",
     logo_url="Image URL used as submission thumbnail, or none",
@@ -3102,7 +3454,7 @@ async def setup_brand_extras(
     )
 
 
-@tree.command(name="post_submit_panel", description="Pro: post a branded submit button panel")
+@tree.command(name="post_panel", description="Pro: post a branded submit button panel")
 async def post_submit_panel(interaction: discord.Interaction):
     logger.info("Received /post_submit_panel from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
     error = require_pro_admin(interaction)
@@ -3118,7 +3470,7 @@ async def post_submit_panel(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, view=SubmitPanelView())
 
 
-@tree.command(name="staff_note", description="Pro staff: add a private note to a ticket")
+@tree.command(name="note", description="Pro staff: add a private note to a submission")
 @app_commands.describe(ticket_id="Ticket ID to annotate", note="Private staff note")
 async def staff_note(interaction: discord.Interaction, ticket_id: str, note: str):
     logger.info("Received /staff_note from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
@@ -3148,7 +3500,7 @@ async def staff_note(interaction: discord.Interaction, ticket_id: str, note: str
     )
 
 
-@tree.command(name="assign_reviewer", description="Pro staff: assign a reviewer to a ticket")
+@tree.command(name="reviewer", description="Pro staff: assign a reviewer to a submission")
 @app_commands.describe(ticket_id="Ticket ID to assign", reviewer="Reviewer responsible for this submission")
 async def assign_reviewer_command(interaction: discord.Interaction, ticket_id: str, reviewer: discord.Member):
     logger.info("Received /assign_reviewer from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
@@ -3178,6 +3530,161 @@ async def assign_reviewer_command(interaction: discord.Interaction, ticket_id: s
     )
 
 
+@tree.command(name="shortlist", description="Pro staff: add or remove a submission from the shortlist")
+@app_commands.describe(ticket_id="Submission ticket ID", enabled="Whether this submission is shortlisted")
+async def shortlist(interaction: discord.Interaction, ticket_id: str, enabled: bool = True):
+    logger.info("Received /shortlist from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    if not user_can_manage_submissions(interaction):
+        await interaction.response.send_message("You do not have permission to use this.", ephemeral=True)
+        return
+    if not guild_has_premium(interaction.guild_id):
+        await interaction.response.send_message("This is a Pro feature.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    database_url = get_guild_database_url(interaction.guild_id)
+    ensure_submission_table(database_url) if database_url else None
+    normalized_ticket_id = normalize_ticket_id(ticket_id)
+    saved = update_submission_flags(database_url, normalized_ticket_id, shortlisted=enabled)
+    if enabled and saved:
+        update_submission_status(database_url, normalized_ticket_id, "Shortlisted")
+    await interaction.followup.send(
+        f"`{normalized_ticket_id}` {'added to' if enabled else 'removed from'} shortlist."
+        if saved
+        else f"Could not update `{normalized_ticket_id}`.",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="priority", description="Pro staff: mark a submission as priority")
+@app_commands.describe(ticket_id="Submission ticket ID", enabled="Whether this submission is priority")
+async def priority(interaction: discord.Interaction, ticket_id: str, enabled: bool = True):
+    logger.info("Received /priority from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    if not user_can_manage_submissions(interaction):
+        await interaction.response.send_message("You do not have permission to use this.", ephemeral=True)
+        return
+    if not guild_has_premium(interaction.guild_id):
+        await interaction.response.send_message("This is a Pro feature.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    database_url = get_guild_database_url(interaction.guild_id)
+    ensure_submission_table(database_url) if database_url else None
+    normalized_ticket_id = normalize_ticket_id(ticket_id)
+    saved = update_submission_flags(database_url, normalized_ticket_id, priority=enabled)
+    await interaction.followup.send(
+        f"`{normalized_ticket_id}` priority {'enabled' if enabled else 'disabled'}."
+        if saved
+        else f"Could not update `{normalized_ticket_id}`.",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="rate", description="Pro staff: rate a demo from 1 to 10")
+@app_commands.describe(ticket_id="Submission ticket ID", score="Score from 1 to 10")
+async def rate(interaction: discord.Interaction, ticket_id: str, score: int):
+    logger.info("Received /rate from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    if not user_can_manage_submissions(interaction):
+        await interaction.response.send_message("You do not have permission to use this.", ephemeral=True)
+        return
+    if not guild_has_premium(interaction.guild_id):
+        await interaction.response.send_message("This is a Pro feature.", ephemeral=True)
+        return
+    if score < 1 or score > 10:
+        await interaction.response.send_message("Score must be between 1 and 10.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    database_url = get_guild_database_url(interaction.guild_id)
+    ensure_submission_table(database_url) if database_url else None
+    normalized_ticket_id = normalize_ticket_id(ticket_id)
+    saved = update_submission_flags(database_url, normalized_ticket_id, rating=score)
+    await interaction.followup.send(
+        f"`{normalized_ticket_id}` rated **{score}/10**."
+        if saved
+        else f"Could not rate `{normalized_ticket_id}`.",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="shortlisted", description="Pro staff: show shortlisted submissions")
+async def shortlisted(interaction: discord.Interaction):
+    logger.info("Received /shortlisted from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    if not user_can_manage_submissions(interaction):
+        await interaction.response.send_message("You do not have permission to use this.", ephemeral=True)
+        return
+    if not guild_has_premium(interaction.guild_id):
+        await interaction.response.send_message("This is a Pro feature.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    database_url = get_guild_database_url(interaction.guild_id)
+    ensure_submission_table(database_url) if database_url else None
+    rows = fetch_shortlisted_submissions(database_url)
+    await interaction.followup.send(embed=submissions_to_embed("Shortlisted Submissions", rows), ephemeral=True)
+
+
+@tree.command(name="reasons", description="Pro admin: set or view saved rejection reasons")
+@app_commands.describe(reasons="Separate reasons with |, or leave blank to view current reasons")
+async def reasons(interaction: discord.Interaction, reasons: str = ""):
+    logger.info("Received /reasons from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    error = require_pro_admin(interaction)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+
+    if not reasons.strip():
+        current = parse_rejection_reasons(get_pro_settings(interaction.guild_id))
+        text = "\n".join(f"- {reason}" for reason in current) if current else "No saved rejection reasons yet."
+        await interaction.response.send_message(text, ephemeral=True)
+        return
+
+    cleaned = " | ".join(
+        truncate_text(reason.strip(), 180)
+        for reason in reasons.split("|")
+        if reason.strip()
+    )
+    saved = upsert_pro_settings(interaction.guild_id, interaction.user.id, rejection_reasons=cleaned)
+    await interaction.response.send_message(
+        "Saved rejection reasons updated." if saved else "I could not save rejection reasons.",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="digest", description="Pro admin: post a weekly submission digest")
+@app_commands.describe(channel="Optional channel to save as the weekly digest target")
+async def digest(interaction: discord.Interaction, channel: discord.TextChannel = None):
+    logger.info("Received /digest from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    error = require_pro_admin(interaction)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    if channel:
+        upsert_pro_settings(interaction.guild_id, interaction.user.id, digest_channel_id=channel.id)
+    settings = get_pro_settings(interaction.guild_id)
+    target_id = channel.id if channel else int(settings.get("digest_channel_id") or 0)
+    target = client.get_channel(target_id) if target_id else interaction.channel
+    if not isinstance(target, discord.TextChannel):
+        await interaction.followup.send("I could not find a digest channel.", ephemeral=True)
+        return
+
+    database_url = get_guild_database_url(interaction.guild_id)
+    ensure_submission_table(database_url) if database_url else None
+    stats = fetch_weekly_digest_stats(database_url)
+    embed = discord.Embed(title="Weekly Submission Digest", color=server_embed_color(interaction))
+    embed.add_field(name="New", value=str(stats.get("new", 0)), inline=True)
+    embed.add_field(name="Approved", value=str(stats.get("approved", 0)), inline=True)
+    embed.add_field(name="Rejected", value=str(stats.get("rejected", 0)), inline=True)
+    embed.add_field(name="Pending", value=str(stats.get("pending", 0)), inline=True)
+    embed.add_field(name="Shortlisted", value=str(stats.get("shortlisted", 0)), inline=True)
+    embed.add_field(name="Priority", value=str(stats.get("priority", 0)), inline=True)
+    embed.add_field(name="Avg Rating", value=str(stats.get("avg_rating", 0)), inline=True)
+    await target.send(embed=embed)
+    await interaction.followup.send(f"Digest posted in {target.mention}.", ephemeral=True)
+
+
 @tree.command(name="analytics", description="Pro admin: view advanced submission analytics")
 async def analytics(interaction: discord.Interaction):
     logger.info("Received /analytics from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
@@ -3203,7 +3710,7 @@ async def analytics(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@tree.command(name="export_submissions", description="Pro admin: export submissions as CSV")
+@tree.command(name="export", description="Pro admin: export submissions as CSV")
 async def export_submissions(interaction: discord.Interaction):
     logger.info("Received /export_submissions from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
     error = require_pro_admin(interaction)
@@ -3220,6 +3727,7 @@ async def export_submissions(interaction: discord.Interaction):
     writer.writerow([
         "ticket_id", "user_id", "name", "discord_username", "track_name", "track_link",
         "artist_names", "message", "status", "created_at", "reviewer_id", "staff_notes",
+        "rating", "shortlisted", "priority",
     ])
     writer.writerows(rows)
     data = output.getvalue().encode("utf-8")
@@ -3230,7 +3738,7 @@ async def export_submissions(interaction: discord.Interaction):
     )
 
 
-@tree.command(name="ticket", description="Look up a submission ticket")
+@tree.command(name="submission", description="Look up a label submission")
 @app_commands.describe(ticket_id="Ticket ID, such as LABEL-ABCD1234-EFGH5678")
 async def ticket(interaction: discord.Interaction, ticket_id: str):
     logger.info("Received /ticket from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
@@ -3263,7 +3771,96 @@ async def ticket(interaction: discord.Interaction, ticket_id: str):
     await interaction.followup.send(embed=ticket_embed(row, viewer_is_staff), ephemeral=True)
 
 
-@tree.command(name="my_submissions", description="Show your submissions in this server")
+@tree.command(name="ticket_panel", description="Pro admin: post an open-ticket button panel")
+@app_commands.describe(channel="Channel to post the ticket panel in")
+async def ticket_panel(interaction: discord.Interaction, channel: discord.TextChannel):
+    logger.info("Received /ticket_panel from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    error = require_pro_admin(interaction)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title=f"{server_display_name(interaction)} Support",
+        description="Open a ticket and staff will help you in a private thread.",
+        color=server_embed_color(interaction),
+    )
+    await channel.send(embed=embed, view=SupportTicketPanelView())
+    await interaction.response.send_message(f"Ticket panel posted in {channel.mention}.", ephemeral=True)
+
+
+@tree.command(name="tickets", description="Pro staff: show recent support tickets")
+@app_commands.describe(status="Optional ticket status filter")
+@app_commands.choices(
+    status=[
+        app_commands.Choice(name="Open", value="Open"),
+        app_commands.Choice(name="Waiting", value="Waiting"),
+        app_commands.Choice(name="Answered", value="Answered"),
+        app_commands.Choice(name="Closed", value="Closed"),
+    ]
+)
+async def tickets(interaction: discord.Interaction, status: str = ""):
+    logger.info("Received /tickets from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    if not user_can_manage_submissions(interaction):
+        await interaction.response.send_message("You do not have permission to use this.", ephemeral=True)
+        return
+    if not guild_has_premium(interaction.guild_id):
+        await interaction.response.send_message("This is a Pro feature.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    database_url = get_guild_database_url(interaction.guild_id)
+    ensure_submission_table(database_url) if database_url else None
+    rows = fetch_support_tickets(database_url, status if status else None)
+    embed = discord.Embed(title="Support Tickets", color=server_embed_color(interaction))
+    if not rows:
+        embed.description = "No support tickets found."
+    for ticket_id, username, subject, status_value, created_at in rows:
+        embed.add_field(
+            name=f"{ticket_id} - {status_value}",
+            value=f"{truncate_text(subject, 120)}\nOpened by {username}\nCreated: {discord_timestamp(created_at)}",
+            inline=False,
+        )
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@tree.command(name="ticket_set", description="Pro staff: update a support ticket status")
+@app_commands.describe(ticket_id="Support ticket ID", new_status="New support ticket status")
+@app_commands.choices(
+    new_status=[
+        app_commands.Choice(name="Open", value="Open"),
+        app_commands.Choice(name="Waiting", value="Waiting"),
+        app_commands.Choice(name="Answered", value="Answered"),
+        app_commands.Choice(name="Closed", value="Closed"),
+    ]
+)
+async def ticket_status(
+    interaction: discord.Interaction,
+    ticket_id: str,
+    new_status: app_commands.Choice[str],
+):
+    logger.info("Received /ticket_status from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    if not user_can_manage_submissions(interaction):
+        await interaction.response.send_message("You do not have permission to use this.", ephemeral=True)
+        return
+    if not guild_has_premium(interaction.guild_id):
+        await interaction.response.send_message("This is a Pro feature.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    database_url = get_guild_database_url(interaction.guild_id)
+    ensure_submission_table(database_url) if database_url else None
+    normalized_ticket_id = normalize_ticket_id(ticket_id)
+    updated = update_support_ticket_status(database_url, normalized_ticket_id, new_status.value)
+    await interaction.followup.send(
+        f"`{normalized_ticket_id}` set to **{new_status.value}**."
+        if updated
+        else f"Could not update `{normalized_ticket_id}`.",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="my_subs", description="Show your submissions in this server")
 async def my_submissions(interaction: discord.Interaction):
     logger.info("Received /my_submissions from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
     await interaction.response.defer(ephemeral=True)
@@ -3317,7 +3914,7 @@ async def my_stats(interaction: discord.Interaction):
     )
 
 
-@tree.command(name="accepted_leaderboard", description="Show artists with the most accepted demos")
+@tree.command(name="leaderboard", description="Show artists with the most accepted demos")
 async def accepted_leaderboard(interaction: discord.Interaction):
     logger.info("Received /accepted_leaderboard from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
     await interaction.response.defer()
@@ -3343,6 +3940,10 @@ async def accepted_leaderboard(interaction: discord.Interaction):
 @app_commands.choices(
     new_status=[
         app_commands.Choice(name="In Queue", value="In Queue"),
+        app_commands.Choice(name="Needs Review", value="Needs Review"),
+        app_commands.Choice(name="Shortlisted", value="Shortlisted"),
+        app_commands.Choice(name="Contacted", value="Contacted"),
+        app_commands.Choice(name="Signed", value="Signed"),
         app_commands.Choice(name="Approved", value="Approved"),
         app_commands.Choice(name="Rejected", value="Rejected"),
     ]
@@ -3370,6 +3971,7 @@ async def panel(interaction: discord.Interaction):
 
     await interaction.response.defer(ephemeral=True)
     database_url = get_guild_database_url(interaction.guild_id)
+    ensure_submission_table(database_url) if database_url else None
     view = SubmissionPanelView(database_url)
     embed = view.load_embed()
     await interaction.followup.send(embed=embed, view=view, ephemeral=True)
@@ -3419,6 +4021,9 @@ def ticket_embed(row: tuple, viewer_is_staff: bool) -> discord.Embed:
         created_at,
         reviewer_id,
         staff_notes,
+        rating,
+        shortlisted,
+        priority,
     ) = row
     embed = discord.Embed(
         title=f"Ticket {ticket_id}",
@@ -3432,6 +4037,9 @@ def ticket_embed(row: tuple, viewer_is_staff: bool) -> discord.Embed:
     embed.add_field(name="Artists", value=truncate_text(artist_names, 500), inline=False)
     embed.add_field(name="Demo Link", value=truncate_text(track_link, 900), inline=False)
     embed.add_field(name="Message", value=truncate_text(clean_submission_message(message), 900), inline=False)
+    embed.add_field(name="Priority", value="Yes" if priority else "No", inline=True)
+    embed.add_field(name="Shortlisted", value="Yes" if shortlisted else "No", inline=True)
+    embed.add_field(name="Rating", value=f"{rating}/10" if rating else "Unrated", inline=True)
     if viewer_is_staff:
         embed.add_field(name="User ID", value=str(user_id or "Unknown"), inline=True)
         embed.add_field(
@@ -3561,6 +4169,7 @@ async def queue(interaction: discord.Interaction):
 
     await interaction.response.defer(ephemeral=True)
     database_url = get_guild_database_url(interaction.guild_id)
+    ensure_submission_table(database_url) if database_url else None
     rows = fetch_panel_submissions(database_url, status="In Queue", limit=5, sort_order="newest")
     await interaction.followup.send(
         embed=queue_list_embed(rows),
@@ -3577,6 +4186,7 @@ async def recent(interaction: discord.Interaction):
 
     await interaction.response.defer(ephemeral=True)
     database_url = get_guild_database_url(interaction.guild_id)
+    ensure_submission_table(database_url) if database_url else None
     rows = fetch_submissions(database_url, limit=5)
     await interaction.followup.send(embed=submissions_to_embed("Newest Submissions", rows), ephemeral=True)
 
@@ -3607,7 +4217,7 @@ def validate_startup_environment() -> bool:
     if not OWNER_USER_IDS:
         logger.warning("OWNER_USER_IDS is missing. Owner-only premium commands will reject everyone.")
     if DEFAULT_STAFF_CHANNEL_ID == 0:
-        logger.warning("STAFF_CHANNEL_ID is missing. Servers must run /setup_staff_channel.")
+        logger.warning("STAFF_CHANNEL_ID is missing. Servers must run /setup_staff.")
     if DISCORD_GUILD_ID == 0:
         logger.warning("DISCORD_GUILD_ID is missing. Global slash command updates can take up to 1 hour.")
     return ok
