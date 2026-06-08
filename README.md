@@ -8,116 +8,90 @@ app_port: 7860
 
 # LabelUtils
 
-LabelUtils Discord submission bot.
+LabelUtils is a Discord bot for labels, collectives, and A&R teams that need a clean way to collect demos, review submissions, manage staff notes, and stay in touch with artists.
 
-## Environment variables
+## What It Does
 
-Add these runtime secrets/environment variables:
+Artists submit demos through a Discord form. Staff receive a private submission card with approve, reject, and DM actions. Each submission can open a private staff discussion thread, so decisions, notes, DMs, and release logs stay attached to the right ticket.
 
-- `DISCORD_BOT_TOKEN`
-- `DATABASE_URL` bot-owner control database for encrypted server database URLs, staff channel IDs, and manual premium grants
-- `POOL_DATABASE_URL_1` managed storage database for West US
-- `POOL_DATABASE_URL_2` managed storage database for Europe (UK)
-- `POOL_DATABASE_URL_3` managed storage database for South-East Asia
-- `CONFIG_ENCRYPTION_KEY` Fernet key used to encrypt server database URLs
-- `DISCORD_GUILD_ID` strongly recommended while testing so slash-command changes appear immediately in that server
-- `STAFF_CHANNEL_ID` optional fallback staff channel for single-server installs
-- `FORCE_IPV4` optional, defaults to `1`; set to `0` only if your host needs IPv6 DNS results
-- `PORT` optional, defaults to `7860`; set this to the web port your host assigns
-- `CLEAR_GLOBAL_COMMANDS` optional, defaults to `1` when testing with `DISCORD_GUILD_ID`; set to `0` if you want to keep global commands
-- `OWNER_USER_IDS` comma-separated Discord user IDs allowed to run owner-only premium commands
-- `PREMIUM_CONTACT` text shown by `/premium`, such as contact details and accepted crypto
+Servers can also use LabelUtils as a private support-ticket tool. Users click a public ticket button, while the actual ticket card appears in a staff-only channel with Resolved and DM buttons.
 
-Enable Message Content Intent for the bot in the Discord Developer Portal if you want artist DM replies to staff messages to appear in the staff thread.
+## Getting Started
 
-Generate `CONFIG_ENCRYPTION_KEY` with:
+Server admins use:
 
-```bash
-python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-```
+- `/start` to create managed storage for the server.
+- `/setup_staff` to choose where demo submissions are sent.
+- `/setup` to check the server setup.
+- `/help` to see the command list inside Discord.
 
-After the bot is running, a server administrator should run:
+Free servers are automatically assigned managed storage. Pro servers can choose a storage region or connect their own Neon database.
 
-- `/start` to automatically assign this server to a random managed pooled database. LabelUtils creates a private PostgreSQL schema like `guild_123456789` and prepares that server's submissions, tickets, branding, and Pro settings tables inside it.
-- `/setup_staff` to choose where new submissions and tickets are sent for that server.
-- `/setup` to verify the server database, staff channel, and required bot-owner config.
-- `/storage` is a Pro command for choosing West US, Europe (UK), or South-East Asia managed storage.
-- `/setup_db` is optional Pro advanced setup for servers that want to bring their own Neon PostgreSQL URL instead of using managed pooled storage.
+## Artist Commands
 
-Users can run `/help` for the command list, `/submission` to check one label submission, `/my_subs` or `/my_demos` to see their own ticket history, and `/my_stats` to see submitted/accepted counts. `/leaderboard` shows a paginated leaderboard of Discord submitters with the most accepted demos. New submissions are checked for duplicate demo links and each staff submission card opens a staff discussion thread when the bot has thread permissions.
+- `/submit` opens the demo submission form.
+- `/submission` checks one submitted demo by ticket ID.
+- `/my_subs` shows your submitted demos.
+- `/my_demos` shows more of your submission history.
+- `/my_stats` shows submitted, accepted, rejected, and queued counts.
+- `/leaderboard` shows top accepted submitters.
 
-Premium is manually managed through the control database:
+## Staff Workflow
 
-- `/premium` shows users how to contact you to buy premium.
-- `/pro_status` checks the current server's premium state.
-- `/redeem` lets a server administrator redeem a premium coupon for the current server.
-- `/coupon` creates a reusable premium coupon with a configurable use count. Owner-only via `OWNER_USER_IDS`.
-- `/pro_add` grants premium to a server. Owner-only via `OWNER_USER_IDS`.
-- `/pro_remove` removes premium from a server. Owner-only via `OWNER_USER_IDS`.
-- `/brand` opens a form where Pro servers customize the display name, embed color, and submit panel caption used in supported server-specific messages.
-- `/brand_info` shows the active brand settings.
-- `/brand_clear` resets branding to server defaults.
-- `/storage` lets Pro servers choose West US, Europe (UK), or South-East Asia managed storage.
-- `/form` customizes the optional submission prompt.
-- `/templates` opens a form for approval/rejection DMs. Either field can be left blank to keep the current template.
-- `/limits` configures cooldowns, submission caps, and duplicate-link policy.
-- `/routing` routes approved/rejected updates to separate channels.
-- `/extras` sets footer text, logo thumbnail, and custom success message.
-- `/post_panel` posts a branded submit button panel.
-- `/note` adds private staff notes to submissions.
-- `/reviewer` assigns staff reviewers to submissions.
-- `/shortlist`, `/shortlisted`, `/priority`, and `/rate` add A&R workflow tools for Pro servers.
-- `/reasons` stores common rejection reasons for staff.
-- `/digest` posts a weekly submission digest to a chosen channel.
-- `/ticket_channel` chooses the private staff channel where support ticket cards are posted.
+Staff can:
+
+- Browse submissions with `/queue`, `/recent`, and `/panel`.
+- Update a submission with `/status`.
+- Approve, reject, or DM artists from submission cards.
+- Keep release logs inside staff threads.
+- Receive artist replies from DMs back inside the matching staff thread.
+
+DM reply forwarding works when the artist replies directly to the bot's DM message. Attachments are forwarded as Discord attachment links, so files are not downloaded or reuploaded by the bot.
+
+## Pro Features
+
+Pro is built for teams that want a fuller A&R workflow:
+
+- Custom branding with `/brand`, `/brand_info`, and `/brand_clear`.
+- Custom submit panel with `/post_panel`.
+- Custom approval and rejection DM templates with `/templates`.
+- Custom form prompt with `/form`.
+- Cooldowns, duplicate-link behavior, and submission limits with `/limits`.
+- Approved/rejected routing channels with `/routing`.
+- Footer, logo, and success-message customization with `/extras`.
+- Staff notes with `/note`.
+- Reviewer assignment with `/reviewer`.
+- Shortlist tools with `/shortlist` and `/shortlisted`.
+- Priority submissions with `/priority`.
+- Demo ratings with `/rate`.
+- Saved rejection reasons with `/reasons`.
+- Weekly digest with `/digest`.
+- Analytics with `/analytics`.
+- CSV export with `/export`.
+- Storage region selection with `/storage`.
+- Optional custom Neon database with `/setup_db`.
+
+## Support Tickets
+
+Pro servers can run a normal ticket-tool style flow:
+
+- `/ticket_channel` sets the private staff channel where ticket cards appear.
 - `/ticket_panel` posts the public button panel users click to open tickets.
-- `/tickets` and `/ticket_set` manage support tickets with separate statuses. Ticket cards have Resolved and DM buttons; DM replies are routed back into the ticket thread.
-- `/analytics` shows submission analytics.
-- `/export` exports a CSV.
-- Artist replies to staff DMs are forwarded into the submission's staff thread. Attachments are forwarded as Discord attachment links, so the bot does not download/reupload files into memory.
+- `/tickets` lists recent support tickets.
+- `/ticket_set` updates ticket status.
 
-Each server's submissions, support tickets, Pro branding, and Pro settings are stored either in its managed pooled schema or in its custom configured Neon database. The owner control database stores pool assignment, encrypted custom database links, staff-channel setup, and premium status.
+Ticket cards are private to staff. The submitter only gets a confirmation and can be contacted by DM. Staff can press DM on a ticket card, and the user's DM reply is routed back into the ticket thread.
 
-Submission threads also receive release logs for submission creation, approval, rejection, and staff DM actions.
-Visible submission and premium dates use Discord native timestamps, so Discord renders them in each user's local timezone.
-Discord modals support a maximum of five text inputs, so LabelUtils keeps the five core submission fields and Pro form customization currently changes the optional message field's label and placeholder.
+## Premium
 
-Discord does not support changing a bot's actual avatar or online presence separately per server. Pro branding is server-specific inside LabelUtils messages and embeds, and `/brand` also tries to update the bot's server nickname when Discord permissions allow it.
+- `/premium` shows how to buy premium.
+- `/pro_status` checks the server's current premium state.
+- `/redeem` redeems a premium coupon for the current server.
 
-The app exposes a small health endpoint on `/` and `/health` while the Discord bot runs in the same process.
+Premium is manually handled by the bot owner, so labels can contact the owner, pay, and receive a redeemable coupon.
 
-## JustRunMy.App setup
+## Notes
 
-Use the Python app flow:
+Discord modals allow up to five text inputs. LabelUtils keeps the five core demo fields and lets Pro servers customize the optional message prompt.
 
-1. Zip this project folder.
-2. Create a Python application in JustRunMy.App.
-3. Upload the zip.
-4. Add the environment variables above.
-5. Add/open the app port using the same value as `PORT`.
-6. Start the app.
-
-The app can be started with either:
-
-```bash
-python bot.py
-```
-
-or:
-
-```bash
-python app.py
-```
-
-`app.py` exists only as a conventional Python hosting entrypoint.
-
-## Render setup
-
-Create a Web Service from this repo and set:
-
-```bash
-Build Command: pip install -r requirements.txt
-Start Command: python bot.py
-```
-
-Do not use Render's default `gunicorn your_application.wsgi` command; this is a Discord bot, not a Django app.
+Discord does not allow a bot to have a different avatar or online status per server. LabelUtils branding applies inside server-specific messages and embeds, and `/brand` also tries to update the bot's server nickname when permissions allow it.
