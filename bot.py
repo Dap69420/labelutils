@@ -3214,6 +3214,11 @@ async def help_command(interaction: discord.Interaction):
         ),
         inline=False,
     )
+    embed.add_field(
+        name="Docs",
+        value="Full setup guides and command reference: https://labelutils.dapmedia.tech",
+        inline=False,
+    )
     embed.set_footer(text=f"Premium: {'active' if premium_active else 'not active'}")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 

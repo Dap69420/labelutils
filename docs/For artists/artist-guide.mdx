@@ -1,0 +1,49 @@
+---
+title: "Artist Guide"
+description: "How to submit demos and track your submissions"
+sidebarTitle: "Artist guide"
+---
+
+If you're an artist sending demos to a label that uses LabelUtils, everything happens inside Discord. No external links, no sign-ups.
+
+## Submitting a demo
+
+In the label's Discord server, run:
+
+```text
+/submit
+```
+
+A form opens with up to five fields. (Pro labels can customize the optional message prompt with their own question.) Fill it in and hit submit — you'll get a confirmation with your **ticket ID**. Keep this if you want to check on the submission later.
+
+<Tip>
+  Always submit your strongest work. Most labels keep a public leaderboard of top accepted submitters via `/leaderboard`.
+</Tip>
+
+## Tracking your submissions
+
+| Command | What it does |
+| --- | --- |
+| `/submission ticket_id:<id>` | Look up one submission by its ticket ID (you can only see your own) |
+| `/my_subs` | Show your submissions in the current server |
+| `/my_demos` | Show a longer list of demos you submitted |
+| `/my_stats` | Show your total submitted, accepted, rejected, and queued counts |
+| `/leaderboard` | Show the top accepted submitters in this server |
+
+<Note>
+  The leaderboard groups by Discord user (not by display name), so changing your nickname won't split your stats.
+</Note>
+
+## Replying to staff
+
+If the label's staff sends you a **DM through the bot**, you can reply directly to that DM message. Your reply — including attachments — is automatically forwarded back to the staff thread for your submission.
+
+<Info>
+  Attachments you send are forwarded as Discord attachment links. The bot does not download or reupload your files.
+</Info>
+
+## Tips
+
+- Submit one track per `/submit` — don't spam the form.
+- If the server has a cooldown, duplicate-link rule, or per-user submission cap, the bot will let you know.
+- Make sure your DMs are open to server members so staff can reach you.

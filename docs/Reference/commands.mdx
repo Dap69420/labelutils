@@ -1,0 +1,122 @@
+---
+title: "Commands"
+description: "Full reference of public LabelUtils slash commands"
+sidebarTitle: "Commands"
+---
+
+Every public LabelUtils slash command, grouped by who uses it. Run `/help` in Discord to see a shorter command list inside your server.
+
+<Info>
+  Commands marked **Pro** require an active Pro server. Bot-owner-only maintenance commands are intentionally not listed here.
+</Info>
+
+## Everyone
+
+| Command | Description |
+| --- | --- |
+| `/help` | Show the command list and setup steps inside Discord. |
+| `/premium` | See how to buy Pro for the current server. |
+| `/pro_status` | Check whether the current server has Pro. |
+
+## Artists
+
+| Command | Description |
+| --- | --- |
+| `/submit` | Open the demo submission form. |
+| `/submission ticket_id:<id>` | Look up one submission. Artists can only view their own submissions; staff can view any submission. |
+| `/my_subs` | Show your submissions in the current server. |
+| `/my_demos` | Show a longer list of demos you submitted. |
+| `/my_stats` | Show your submitted, accepted, rejected, and queued counts. |
+| `/leaderboard` | Show top accepted submitters, grouped by Discord user so name changes do not split stats. |
+
+## Server Setup
+
+| Command | Description |
+| --- | --- |
+| `/start label_name:<name>` | Create managed LabelUtils storage and set the server's label name. |
+| `/setup_staff channel:<channel>` | Set the private staff channel where new submission cards are posted. |
+| `/setup` | Check storage, Pro status, branding, staff channel, ticket channel, and thread permissions. |
+| `/db_status` | Check which storage is connected. Managed storage shows the region and schema. |
+| `/staff_status` | Check which staff channel is connected. |
+| `/setup_db` | **Pro**: connect a custom Neon database. |
+| `/storage region:<region>` | **Pro**: move managed storage to West US, Europe (UK), or South-East Asia. |
+
+<Note>
+  Free servers use managed storage automatically. Pro servers can move regions or connect a custom database. When storage changes, LabelUtils migrates existing submissions, tickets, branding, and Pro settings before switching.
+</Note>
+
+## Staff Submissions
+
+| Command | Description |
+| --- | --- |
+| `/queue` | Show the newest submissions still in queue. |
+| `/recent` | Show the newest submissions across all statuses. |
+| `/panel` | Open an admin browser with filters, pages, and refresh controls. |
+| `/status ticket_id:<id> new_status:<status>` | Update a submission's status. |
+
+Available submission statuses:
+
+- In Queue
+- Needs Review
+- Shortlisted
+- Contacted
+- Signed
+- Approved
+- Rejected
+
+Staff submission cards also include **Approve**, **Reject**, and **DM** buttons. Each submission can open a private staff discussion thread so notes, DM replies, and release logs stay attached to the right ticket.
+
+<Note>
+  DM reply forwarding works when the artist replies directly to the bot's DM message. Attachments are forwarded as Discord attachment links; files are not downloaded or reuploaded by the bot.
+</Note>
+
+## Pro Branding And Customization
+
+| Command | Description |
+| --- | --- |
+| `/brand` | Open a form to set display name, required submit panel caption, and embed color. |
+| `/brand_info` | Show the current Pro branding and premium state. |
+| `/brand_clear` | Reset custom branding back to server defaults. |
+| `/post_panel` | Post a branded public submit button panel. |
+| `/form label:<text> placeholder:<text>` | Customize the optional submission question. |
+| `/templates` | Edit approval and rejection DM templates. Either template can be changed on its own. |
+| `/extras footer_text:<text> logo_url:<url or none> success_message:<text>` | Customize staff card footers, thumbnails, and submitter confirmation text. |
+
+## Pro Submission Rules And Routing
+
+| Command | Description |
+| --- | --- |
+| `/limits cooldown_minutes:<minutes> max_submissions_per_user:<count> duplicate_policy:<policy>` | Configure cooldowns, total user caps, and duplicate-link handling. |
+| `/routing approved_channel:<channel> rejected_channel:<channel>` | Send approved and rejected updates to selected channels. |
+
+## Pro A&R Tools
+
+| Command | Description |
+| --- | --- |
+| `/note ticket_id:<id> note:<text>` | Add a private staff note to a submission. |
+| `/reviewer ticket_id:<id> reviewer:<member>` | Assign a reviewer to a submission. |
+| `/shortlist ticket_id:<id> enabled:<true or false>` | Add or remove a submission from the shortlist. |
+| `/shortlisted` | Show shortlisted submissions. |
+| `/priority ticket_id:<id> enabled:<true or false>` | Mark or unmark a submission as priority. |
+| `/rate ticket_id:<id> score:<1-10>` | Give a demo an internal rating. |
+| `/reasons reasons:<reason, reason>` | Set saved rejection reasons. Leave the option blank to show current reasons. |
+| `/digest channel:<channel>` | Post a weekly submission digest and save the digest target channel. |
+| `/analytics` | Show Pro submission analytics. |
+| `/export` | Export submissions as a CSV file. |
+
+## Pro Support Tickets
+
+| Command | Description |
+| --- | --- |
+| `/ticket_channel channel:<channel>` | Set the private staff channel where ticket cards appear. |
+| `/ticket_panel channel:<channel>` | Post the public button panel users click to open tickets. |
+| `/tickets status:<optional>` | List recent support tickets, optionally filtered by Open, Waiting, Answered, or Resolved. |
+| `/ticket_set ticket_id:<id> new_status:<status>` | Update a support ticket to Open, Waiting, Answered, or Resolved. |
+
+## Premium
+
+| Command | Description |
+| --- | --- |
+| `/premium` | See how to buy Pro. |
+| `/pro_status` | Check the server's current Pro status. |
+| `/redeem code:<coupon>` | Redeem a Pro coupon for the current server. |

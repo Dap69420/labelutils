@@ -1,0 +1,53 @@
+---
+title: "FAQs"
+description: "Answers to common questions about LabelUtils"
+sidebarTitle: "FAQ"
+---
+
+<AccordionGroup>
+  <Accordion title="Is LabelUtils free?">
+    Yes. The core submission flow, staff cards, threads, status updates, and DM routing are free. Pro unlocks branding, customization, analytics, support tickets, and more — see [Free vs Pro](/free-vs-pro).
+  </Accordion>
+
+  <Accordion title="How do I get Pro?">
+    Run `/premium` in your server to see how to contact the bot owner. After payment you'll get a coupon code — redeem it with `/redeem code:<your-coupon>` in your server. Check status with `/pro_status`.
+  </Accordion>
+
+  <Accordion title="Can LabelUtils have a custom avatar or online status per server?">
+    Not on the current Pro plan. Discord does not let a shared bot use a different avatar or online status per server. Pro branding applies to messages, embeds, panels, and (where permissions allow) the bot's server nickname.
+
+    A future [Pro\+ tier](/pro-plus) is planned to let labels run a separate branded bot connection with their own name, avatar, and profile.
+  </Accordion>
+
+  <Accordion title="Why does the submission form only have five fields?">
+    Discord modals only allow up to five text inputs. LabelUtils uses these for the core demo fields. Pro servers can customize the optional message prompt with `/form`.
+  </Accordion>
+
+  <Accordion title="What happens to artist attachments?">
+    Attachments sent in artist DM replies are forwarded as Discord attachment links. The bot does **not** download or reupload artist files.
+  </Accordion>
+
+  <Accordion title="An artist's DM reply didn't reach our staff thread. Why?">
+    DM reply forwarding only works when the artist **replies directly** to a message the bot sent them. A brand-new DM to the bot won't be forwarded. Always start contact using the **DM** button on a submission card.
+  </Accordion>
+
+  <Accordion title="Where is our data stored?">
+    Free servers use managed storage. Pro servers can pick a storage region with `/storage region:<region>` (West US, Europe UK, South-East Asia), or connect their own Neon database with `/setup_db`.
+  </Accordion>
+
+  <Accordion title="What happens to our data when we change storage?">
+    LabelUtils migrates existing submissions, tickets, branding, and Pro settings before switching. Old managed storage is cleaned up after a successful move.
+  </Accordion>
+
+  <Accordion title="Can users see each other's submissions?">
+    No. Submission cards appear in your private staff channel. Submitters only see their own submissions via `/my_subs`, `/my_demos`, `/my_stats`, and `/submission`.
+  </Accordion>
+
+  <Accordion title="How do support tickets stay private?">
+    The public panel is just a button. When pressed, the actual ticket card is posted to your staff-only channel. The user only gets a confirmation, and staff reach them via the DM button.
+  </Accordion>
+
+  <Accordion title="Why does the leaderboard not match nicknames I remember?">
+    The leaderboard groups by Discord user ID, not display name. That way, name changes and nickname variations don't split an artist's stats.
+  </Accordion>
+</AccordionGroup>

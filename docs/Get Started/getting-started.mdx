@@ -1,0 +1,91 @@
+---
+title: "Getting started"
+description: "Add LabelUtils to your Discord server and set it up in a few minutes"
+sidebarTitle: "Getting started"
+---
+
+This guide walks server admins through adding LabelUtils and getting it ready to receive demos.
+
+## Before you start
+
+You need to be an admin, or have Manage Server permissions, in the Discord server where you want to install LabelUtils.
+
+LabelUtils also needs permission to send messages, create threads, and send DMs to users who interact with it.
+
+## Setup steps
+
+<Steps>
+  <Step title="Invite the bot">
+    Invite LabelUtils to your Discord server using the invite link. When prompted, accept the default permissions so the bot can read channels, send messages, and create threads.
+  </Step>
+
+  <Step title="Initialize storage with your label name">
+    In your server, run:
+
+    ```text
+    /start label_name:Label Name
+    ```
+
+    Replace `Label Name` with your label or collective's name. This creates managed storage for your server and sets your label name, which LabelUtils uses across messages and embeds.
+
+    <Info>
+      Free servers are automatically assigned managed storage. Pro servers can choose a storage region or connect their own Neon database. See [Free vs Pro](/free-vs-pro).
+    </Info>
+  </Step>
+
+  <Step title="Pick a staff channel">
+    Choose where staff-only submission cards should appear:
+
+    ```text
+    /setup_staff channel:#staff-demos
+    ```
+
+    Pick a private channel that only your reviewers can see. This is where incoming demo cards with Approve, Reject, and DM buttons will appear.
+  </Step>
+
+  <Step title="Verify setup">
+    Run:
+
+    ```text
+    /setup
+    ```
+
+    LabelUtils confirms your storage, Pro status, branding, staff channel, ticket channel, and thread permissions.
+
+    You can also use:
+
+    - `/db_status` to check storage connection
+    - `/staff_status` to check staff channel connection
+  </Step>
+
+  <Step title="Tell artists how to submit">
+    Artists run `/submit` anywhere in your server to open the demo submission form. Pin a message or post in your submissions channel so artists know what to do.
+  </Step>
+</Steps>
+
+## Recommended channel setup
+
+- A public channel where artists can learn how to submit.
+- A private staff channel for demo cards.
+- A private staff ticket channel if you use Pro support tickets.
+- Optional approved and rejected routing channels for Pro servers.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Artist guide" icon="music" href="/artist-guide">
+    Share this page with your artists.
+  </Card>
+
+  <Card title="Staff workflow" icon="users" href="/staff-workflow">
+    Learn how to review submissions efficiently.
+  </Card>
+
+  <Card title="Unlock Pro features" icon="star" href="/free-vs-pro">
+    Branding, templates, analytics, and more.
+  </Card>
+
+  <Card title="Need help?" icon="life-ring" href="/faq">
+    Check the FAQ or run `/help` in Discord.
+  </Card>
+</CardGroup>

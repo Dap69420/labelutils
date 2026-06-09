@@ -1,0 +1,89 @@
+---
+title: "Staff Workflow"
+description: "Review, approve, reject, and DM artists from Discord"
+sidebarTitle: "Staff workflow"
+---
+
+LabelUtils gives your staff a structured way to handle incoming demos without leaving Discord.
+
+## How submissions appear
+
+When an artist runs `/submit`, a **submission card** is posted to your staff channel. Each card includes:
+
+- The artist's submitted info
+- Buttons for **Approve**, **Reject**, and **DM**
+- A link to (or button to open) a private **staff discussion thread** for that submission
+
+The staff thread is where your team keeps notes, release logs, and any back-and-forth with the artist.
+
+## Browsing submissions
+
+| Command | What it does |
+| --- | --- |
+| `/queue` | Newest submissions still in queue |
+| `/recent` | Newest submissions across all statuses |
+| `/panel` | Admin browser with filters, pages, and refresh controls |
+| `/status ticket_id:<id> new_status:<status>` | Update a submission's status |
+
+### Submission statuses
+
+- **In Queue** — not yet reviewed
+- **Needs Review** — flagged for a second listen
+- **Shortlisted** — on the shortlist (Pro: see `/shortlist`)
+- **Contacted** — staff has reached out to the artist
+- **Signed** — artist signed
+- **Approved** — demo accepted
+- **Rejected** — demo declined
+
+## Actions on a submission card
+
+<AccordionGroup>
+  <Accordion title="Approve">
+    Marks the submission as accepted. If you've set up approval routing with `/routing` (Pro), it's automatically posted to your approved channel. The artist gets the configured approval DM (Pro: customize with `/templates`).
+  </Accordion>
+
+  <Accordion title="Reject">
+    Marks the submission as rejected. Pro servers can use saved rejection reasons (`/reasons`) and custom rejection DM templates (`/templates`).
+  </Accordion>
+
+  <Accordion title="DM">
+    Opens a DM to the artist directly from the bot. When the artist replies to that DM, their message (and attachments) is forwarded back into the matching staff thread.
+  </Accordion>
+</AccordionGroup>
+
+## Keeping release logs
+
+Use the **staff thread** attached to each submission to log:
+
+- Decisions and reasoning
+- Mastering or release dates
+- Contracts sent
+- Anything else tied to that artist or track
+
+Because the thread is linked to the submission, you can always find this history later.
+
+## DM reply forwarding
+
+DM reply forwarding only works when the artist **replies directly** to the bot's DM message. Attachments are forwarded as Discord attachment links — the bot does not download or reupload files.
+
+<Warning>
+  If an artist sends a brand-new DM to the bot (instead of replying to the bot's message), it won't be forwarded. Always start contact from the **DM** button on a submission card.
+</Warning>
+
+## Pro-only staff tools
+
+Pro unlocks deeper A&R tooling:
+
+- Staff notes (`/note`)
+- Reviewer assignment (`/reviewer`)
+- Shortlists (`/shortlist`, `/shortlisted`)
+- Priority flags (`/priority`)
+- Demo ratings (`/rate`)
+- Saved rejection reasons (`/reasons`)
+- Weekly digest (`/digest`)
+- Analytics (`/analytics`)
+- CSV export (`/export`)
+- Approved/rejected routing channels (`/routing`)
+- Submission rules: cooldowns, caps, duplicate handling (`/limits`)
+
+See [Free vs Pro](/free-vs-pro) for the full breakdown.
