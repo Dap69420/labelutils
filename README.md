@@ -92,6 +92,18 @@ Ticket cards are private to staff. The submitter only gets a confirmation and ca
 
 Premium is manually handled by the bot owner, so labels can contact the owner, pay, and receive a redeemable coupon.
 
+## Planned Pro+
+
+Pro+ is planned as a deeper white-label option for labels that want LabelUtils to feel like their own private bot.
+
+The idea is to let a Pro+ server connect its own Discord bot token, so the bot can use that label's own bot identity instead of the shared LabelUtils identity. This would allow a custom bot name, avatar, online status, profile description, and invite identity for that label.
+
+Current Pro branding already customizes server-specific messages, embeds, panels, templates, and the bot nickname where Discord permissions allow it. Pro+ would go further by running a separate branded bot connection for the buyer.
+
+This feature is not part of the current Pro plan yet. It requires stronger hosting because every custom bot needs its own Discord gateway connection and more memory. Pro purchases help fund better VPS capacity so Pro+ can be built and supported properly.
+
+When Pro+ is added, Discord bot tokens will be treated like passwords. Tokens should be stored securely, never shown in public messages or logs, and removable or replaceable by the server owner at any time.
+
 ## Notes
 
 Discord modals allow up to five text inputs. LabelUtils keeps the five core demo fields and lets Pro servers customize the optional message prompt.
