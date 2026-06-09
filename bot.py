@@ -1366,6 +1366,13 @@ def get_pro_settings(guild_id: int | None) -> dict[str, object]:
     return settings
 
 
+def cached_submission_form_settings(guild_id: int | None) -> dict[str, object]:
+    settings = dict(DEFAULT_PRO_SETTINGS)
+    if guild_id and guild_id in guild_pro_settings_cache:
+        settings.update(guild_pro_settings_cache[guild_id])
+    return settings
+
+
 def upsert_pro_settings(guild_id: int, updated_by: int, **values: object) -> bool:
     database_url = get_guild_database_url(guild_id)
     if not database_url:
@@ -3025,21 +3032,22 @@ class AdvancedSubmissionModal(discord.ui.Modal, title="New Label Submission"):
 
     def __init__(self, guild_id: int | None = None):
         super().__init__()
-        settings = get_pro_settings(guild_id)
+        settings = cached_submission_form_settings(guild_id)
         self.message.label = truncate_text(settings["message_label"], 45)
         self.message.placeholder = truncate_text(settings["message_placeholder"], 100)
 
     async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
         database_url = get_guild_database_url(interaction.guild_id)
         if not database_url:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "This server has not completed storage setup yet. Ask an admin to run `/start`, or `/setup_db` for a custom Neon database.",
                 ephemeral=True,
             )
             return
         staff_channel_id = get_guild_staff_channel_id(interaction.guild_id)
         if staff_channel_id == 0:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "This server has not set a staff channel yet. Ask an admin to run `/setup_staff`.",
                 ephemeral=True,
             )
@@ -3049,14 +3057,14 @@ class AdvancedSubmissionModal(discord.ui.Modal, title="New Label Submission"):
         remaining = get_cooldown_remaining(interaction.user.id)
         if remaining:
             minutes = max(1, int(remaining.total_seconds() // 60))
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"Please wait about {minutes} minute(s) before submitting again.",
                 ephemeral=True,
             )
             return
 
         if not is_valid_url(self.demo_link.value):
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "Please enter a valid demo link starting with http:// or https://.",
                 ephemeral=True,
             )
@@ -3066,13 +3074,12 @@ class AdvancedSubmissionModal(discord.ui.Modal, title="New Label Submission"):
         if not channel and interaction.guild:
             channel = interaction.guild.get_channel(staff_channel_id)
         if not channel:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "Error: Staff feed channel is unreachable. Check bot permissions and channel ID.",
                 ephemeral=True,
             )
             return
 
-        await interaction.response.defer(ephemeral=True)
         ensure_submission_table(database_url)
 
         max_submissions = int(settings.get("max_submissions_per_user") or 0)
