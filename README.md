@@ -58,7 +58,7 @@ Free servers are automatically assigned managed storage. Pro servers can later u
 - `/queue` shows the newest submissions still in queue.
 - `/recent` shows the newest submissions from all statuses.
 - `/panel` opens an admin browser with filters, pages, and refresh controls.
-- `/status ticket_id:<id> new_status:<status>` updates a submission to In Queue, Needs Review, Shortlisted, Contacted, Signed, Approved, or Rejected.
+- `/status ticket_id:<id> new_status:<status>` updates a submission to In Queue, Needs Review, Shortlisted, Processed, Contacted, Signed, Approved, or Rejected.
 
 Staff submission cards also include approve, reject, and DM actions. Each submission can open a private staff discussion thread, so staff notes, DM replies, and release logs stay attached to the right ticket.
 
@@ -84,6 +84,7 @@ Pro is built for teams that want a fuller A&R workflow:
 - `/reviewer ticket_id:<id> reviewer:<member>` assigns a reviewer to a submission.
 - `/shortlist ticket_id:<id> enabled:<true|false>` adds or removes a submission from the shortlist.
 - `/shortlisted` shows shortlisted submissions.
+- Pro submission cards include quick status buttons for Review, Shortlist, Processed, Contacted, and Signed.
 - `/priority ticket_id:<id> enabled:<true|false>` marks or unmarks a submission as priority.
 - `/rate ticket_id:<id> score:<1-10>` gives a demo an internal rating.
 - `/reasons reasons:<reason | reason>` sets saved rejection reasons, or shows the current saved reasons when left blank.

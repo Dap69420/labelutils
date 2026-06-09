@@ -33,6 +33,11 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 CONFIG_ENCRYPTION_KEY = os.getenv("CONFIG_ENCRYPTION_KEY")
 CLEAR_GLOBAL_COMMANDS = os.getenv("CLEAR_GLOBAL_COMMANDS", "1").lower() not in {"0", "false", "no"}
 PREMIUM_CONTACT = os.getenv("PREMIUM_CONTACT", "Contact the bot owner to buy premium.")
+BOT_INVITE_URL = os.getenv(
+    "BOT_INVITE_URL",
+    "https://discord.com/oauth2/authorize?client_id=1513286315201007737"
+    "&permissions=4503926112110592&integration_type=0&scope=bot%20applications.commands",
+)
 POOL_DATABASE_URLS = {
     index: url
     for index, url in enumerate(
@@ -101,6 +106,7 @@ LABEL_STATUSES = [
     "In Queue",
     "Needs Review",
     "Shortlisted",
+    "Processed",
     "Contacted",
     "Signed",
     "Approved",
@@ -2246,9 +2252,33 @@ async def send_status_route(
         logger.exception("Failed to send %s route message for %s.", status_value, ticket_id)
 
 
-def disable_view_items(view: discord.ui.View) -> None:
-    for item in view.children:
-        item.disabled = True
+def submission_decision_view(guild_id: int | None, *, final_decision: bool = False) -> discord.ui.View:
+    view = ProDecisionButtonsView() if guild_has_premium(guild_id) else DecisionButtonsView()
+    if final_decision:
+        for item in view.children:
+            if getattr(item, "custom_id", "") in {"submission:approve", "submission:reject"}:
+                item.disabled = True
+    return view
+
+
+def status_color(status_value: str, default: int = 0x5865F2) -> int:
+    return {
+        "In Queue": 0x5865F2,
+        "Needs Review": 0xF1C40F,
+        "Shortlisted": 0x9B59B6,
+        "Processed": 0x3498DB,
+        "Contacted": 0x1ABC9C,
+        "Signed": 0x2ECC71,
+        "Approved": 0x43B581,
+        "Rejected": 0xF04747,
+    }.get(status_value, default)
+
+
+def embed_field_value(embed: discord.Embed, field_name: str) -> str | None:
+    for field in embed.fields:
+        if field.name == field_name:
+            return str(field.value)
+    return None
 
 
 def user_can_manage_submissions(interaction: discord.Interaction) -> bool:
@@ -2339,7 +2369,7 @@ async def set_bot_server_nickname(
 
 class LabelUtilsClient(discord.Client):
     async def setup_hook(self) -> None:
-        self.add_view(DecisionButtonsView())
+        self.add_view(ProDecisionButtonsView())
         self.add_view(SubmitPanelView())
         self.add_view(SupportTicketPanelView())
         self.add_view(SupportTicketButtonsView())
@@ -2377,6 +2407,8 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
             await interaction.followup.send(message, ephemeral=True)
         else:
             await interaction.response.send_message(message, ephemeral=True)
+    except discord.NotFound:
+        logger.warning("Could not send slash-command error response because the interaction expired.")
     except Exception:
         logger.exception("Could not send slash-command error response.")
 
@@ -2429,11 +2461,11 @@ class RejectReasonModal(discord.ui.Modal, title="Reject Submission"):
         dm_status = "Artist notified by DM" if dm_sent else "DM failed or unavailable"
         db_status = "DB updated" if db_updated else "DB update failed"
 
-        view = DecisionButtonsView()
-        disable_view_items(view)
+        view = submission_decision_view(interaction.guild_id, final_decision=True)
         old_embed = self.staff_message.embeds[0]
-        old_embed.color = 0xF04747
-        old_embed.add_field(name="Rejection Reason", value=reason_text, inline=False)
+        old_embed.color = status_color("Rejected")
+        set_embed_field(old_embed, "Status", "Rejected", inline=True)
+        set_embed_field(old_embed, "Rejection Reason", reason_text, inline=False)
         old_embed.set_footer(
             text=f"Rejected by @{interaction.user.name} | {dm_status} | {db_status}"
         )
@@ -2541,10 +2573,10 @@ class DecisionButtonsView(discord.ui.View):
         dm_status = "Artist notified by DM" if dm_sent else "DM failed or unavailable"
         db_status = "DB updated" if db_updated else "DB update failed"
 
-        view = DecisionButtonsView()
-        disable_view_items(view)
+        view = submission_decision_view(interaction.guild_id, final_decision=True)
         old_embed = interaction.message.embeds[0]
-        old_embed.color = 0x43B581
+        old_embed.color = status_color("Approved")
+        set_embed_field(old_embed, "Status", "Approved", inline=True)
         old_embed.set_footer(
             text=f"Approved by @{interaction.user.name} | {dm_status} | {db_status}"
         )
@@ -2572,6 +2604,60 @@ class DecisionButtonsView(discord.ui.View):
             return
 
         await interaction.response.send_modal(StaffDmModal(interaction.message))
+
+
+class ProSubmissionStatusButton(discord.ui.Button):
+    def __init__(self, status_value: str, label: str, row: int):
+        super().__init__(
+            label=label,
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"submission:status:{status_value.lower().replace(' ', '_')}",
+            row=row,
+        )
+        self.status_value = status_value
+
+    async def callback(self, interaction: discord.Interaction):
+        if not user_can_manage_submissions(interaction):
+            await interaction.response.send_message("You do not have permission to use this.", ephemeral=True)
+            return
+        if not guild_has_premium(interaction.guild_id):
+            await interaction.response.send_message("Quick status buttons are a Pro feature.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        ticket_id, _artist_id, track_name = submission_info_from_message(interaction.message)
+        database_url = get_guild_database_url(interaction.guild_id)
+        updated = update_submission_status(database_url, ticket_id, self.status_value)
+        if updated and interaction.message.embeds:
+            embed = interaction.message.embeds[0]
+            was_final = embed_field_value(embed, "Status") in {"Approved", "Rejected"}
+            set_embed_field(embed, "Status", self.status_value, inline=True)
+            embed.color = status_color(self.status_value)
+            embed.set_footer(text=f"{self.status_value} by @{interaction.user.name} | DB updated")
+            await interaction.message.edit(
+                embed=embed,
+                view=submission_decision_view(interaction.guild_id, final_decision=was_final),
+            )
+            await log_submission_thread(
+                interaction.message,
+                f"Release log: marked **{self.status_value}** by {interaction.user.mention}.",
+            )
+        await interaction.followup.send(
+            f"`{ticket_id}` marked **{self.status_value}**."
+            if updated
+            else f"Could not update `{ticket_id}`.",
+            ephemeral=True,
+        )
+
+
+class ProDecisionButtonsView(DecisionButtonsView):
+    def __init__(self):
+        super().__init__()
+        self.add_item(ProSubmissionStatusButton("Needs Review", "Review", row=1))
+        self.add_item(ProSubmissionStatusButton("Shortlisted", "Shortlist", row=1))
+        self.add_item(ProSubmissionStatusButton("Processed", "Processed", row=1))
+        self.add_item(ProSubmissionStatusButton("Contacted", "Contacted", row=2))
+        self.add_item(ProSubmissionStatusButton("Signed", "Signed", row=2))
 
 
 class SupportTicketDmModal(discord.ui.Modal, title="DM Ticket User"):
@@ -2638,7 +2724,11 @@ class SupportTicketButtonsView(discord.ui.View):
             set_embed_field(embed, "Status", "Resolved", inline=True)
             embed.color = 0x43B581
             embed.set_footer(text=f"Resolved by @{interaction.user.name}")
-            await interaction.message.edit(embed=embed, view=self)
+            view = SupportTicketButtonsView()
+            for item in view.children:
+                if getattr(item, "custom_id", "") == "support_ticket:resolve":
+                    item.disabled = True
+            await interaction.message.edit(embed=embed, view=view)
             await log_submission_thread(
                 interaction.message,
                 f"Ticket log: resolved by {interaction.user.mention}.",
@@ -3138,12 +3228,13 @@ class AdvancedSubmissionModal(discord.ui.Modal, title="New Label Submission"):
         embed.add_field(name="Track Name", value=self.track_name.value, inline=False)
         embed.add_field(name="Artist Names", value=self.artist_names.value, inline=False)
         embed.add_field(name="Demo Link", value=self.demo_link.value, inline=False)
+        embed.add_field(name="Status", value="In Queue", inline=True)
         embed.add_field(name="Message", value=msg_val, inline=False)
 
         status_text = "Synced to Dashboard DB" if db_saved else "Logged to Channel Only (DB Sync Failure)"
         embed.set_footer(text=f"{footer_text} | {status_text} | Pending Action")
 
-        staff_message = await channel.send(embed=embed, view=DecisionButtonsView())
+        staff_message = await channel.send(embed=embed, view=submission_decision_view(interaction.guild_id))
         set_submission_cooldown(artist_id, int(settings.get("cooldown_minutes") or COOLDOWN_MINUTES))
         success_text = format_template(
             settings.get("success_message"),
@@ -3160,7 +3251,7 @@ class AdvancedSubmissionModal(discord.ui.Modal, title="New Label Submission"):
         )
         if thread:
             embed.add_field(name="Thread ID", value=str(thread.id), inline=False)
-            await staff_message.edit(embed=embed, view=DecisionButtonsView())
+            await staff_message.edit(embed=embed, view=submission_decision_view(interaction.guild_id))
             await thread.send(
                 "Release log: submission received and staff card created."
             )
@@ -3189,7 +3280,8 @@ async def help_command(interaction: discord.Interaction):
             "`/submission` - check a submission\n"
             "`/my_subs` - view your submissions\n"
             "`/my_stats` - view your acceptance stats\n"
-            "`/leaderboard` - see accepted submitters"
+            "`/leaderboard` - see accepted submitters\n"
+            "`/invite` - invite LabelUtils to another server"
         ),
         inline=False,
     )
@@ -3221,6 +3313,14 @@ async def help_command(interaction: discord.Interaction):
     )
     embed.set_footer(text=f"Premium: {'active' if premium_active else 'not active'}")
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@tree.command(name="invite", description="Get the LabelUtils invite link")
+async def invite_command(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        f"[Click Me to Invite]({BOT_INVITE_URL})",
+        ephemeral=True,
+    )
 
 
 class SubmitPanelView(discord.ui.View):
@@ -3258,12 +3358,21 @@ class SupportTicketModal(discord.ui.Modal, title="Open Ticket"):
             return
 
         settings = get_pro_settings(interaction.guild_id)
-        channel_id = int(settings.get("ticket_channel_id") or 0) or get_guild_staff_channel_id(interaction.guild_id)
+        channel_id = int(settings.get("ticket_channel_id") or 0)
+        if channel_id == 0:
+            await interaction.followup.send(
+                "This server has not set a separate ticket staff channel yet. Ask an admin to run `/ticket_channel`.",
+                ephemeral=True,
+            )
+            return
         channel = client.get_channel(channel_id)
         if not channel and interaction.guild:
             channel = interaction.guild.get_channel(channel_id)
         if not isinstance(channel, discord.TextChannel):
-            await interaction.followup.send("This server has not connected a ticket channel yet.", ephemeral=True)
+            await interaction.followup.send(
+                "This server's ticket staff channel is set, but I cannot access it. Ask an admin to run `/ticket_channel` again.",
+                ephemeral=True,
+            )
             return
 
         ticket_id = generate_support_ticket_id()
@@ -4009,9 +4118,10 @@ async def setup_brand_extras(
 @tree.command(name="post_panel", description="Pro: post a branded submit button panel")
 async def post_submit_panel(interaction: discord.Interaction):
     logger.info("Received /post_submit_panel from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    await interaction.response.defer()
     error = require_pro_admin(interaction)
     if error:
-        await interaction.response.send_message(error, ephemeral=True)
+        await interaction.followup.send(error, ephemeral=True)
         return
 
     embed = discord.Embed(
@@ -4019,7 +4129,7 @@ async def post_submit_panel(interaction: discord.Interaction):
         description=server_tagline(interaction) or "Click the button below to submit your demo.",
         color=server_embed_color(interaction),
     )
-    await interaction.response.send_message(embed=embed, view=SubmitPanelView())
+    await interaction.followup.send(embed=embed, view=SubmitPanelView())
 
 
 @tree.command(name="note", description="Pro staff: add a private note to a submission")
@@ -4327,9 +4437,19 @@ async def ticket(interaction: discord.Interaction, ticket_id: str):
 @app_commands.describe(channel="Channel to post the ticket panel in")
 async def ticket_panel(interaction: discord.Interaction, channel: discord.TextChannel):
     logger.info("Received /ticket_panel from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    await interaction.response.defer(ephemeral=True)
     error = require_pro_admin(interaction)
     if error:
-        await interaction.response.send_message(error, ephemeral=True)
+        await interaction.followup.send(error, ephemeral=True)
+        return
+
+    settings = get_pro_settings(interaction.guild_id)
+    ticket_channel_id = int(settings.get("ticket_channel_id") or 0)
+    if ticket_channel_id == 0:
+        await interaction.followup.send(
+            "Set a separate staff ticket channel first with `/ticket_channel`.",
+            ephemeral=True,
+        )
         return
 
     embed = discord.Embed(
@@ -4337,21 +4457,37 @@ async def ticket_panel(interaction: discord.Interaction, channel: discord.TextCh
         description="Open a ticket and staff will help you in a private thread.",
         color=server_embed_color(interaction),
     )
-    await channel.send(embed=embed, view=SupportTicketPanelView())
-    await interaction.response.send_message(f"Ticket panel posted in {channel.mention}.", ephemeral=True)
+    try:
+        await channel.send(embed=embed, view=SupportTicketPanelView())
+    except discord.Forbidden:
+        await interaction.followup.send(
+            f"I cannot post the ticket panel in {channel.mention}. Give me View Channel, Send Messages, and Embed Links there.",
+            ephemeral=True,
+        )
+        return
+    await interaction.followup.send(f"Ticket panel posted in {channel.mention}.", ephemeral=True)
 
 
 @tree.command(name="ticket_channel", description="Pro admin: set the private staff ticket channel")
 @app_commands.describe(channel="Private staff channel where ticket cards should be posted")
 async def ticket_channel(interaction: discord.Interaction, channel: discord.TextChannel):
     logger.info("Received /ticket_channel from guild=%s user=%s channel=%s.", interaction.guild_id, interaction.user.id, channel.id)
+    await interaction.response.defer(ephemeral=True)
     error = require_pro_admin(interaction)
     if error:
-        await interaction.response.send_message(error, ephemeral=True)
+        await interaction.followup.send(error, ephemeral=True)
+        return
+
+    submission_staff_channel_id = get_guild_staff_channel_id(interaction.guild_id)
+    if submission_staff_channel_id and channel.id == submission_staff_channel_id:
+        await interaction.followup.send(
+            "Support tickets need a separate staff channel. Choose a different private channel than your demo submission staff channel.",
+            ephemeral=True,
+        )
         return
 
     saved = upsert_pro_settings(interaction.guild_id, interaction.user.id, ticket_channel_id=channel.id)
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"Ticket channel set to {channel.mention}." if saved else "I could not save the ticket channel.",
         ephemeral=True,
     )
@@ -4510,6 +4646,7 @@ async def accepted_leaderboard(interaction: discord.Interaction):
         app_commands.Choice(name="In Queue", value="In Queue"),
         app_commands.Choice(name="Needs Review", value="Needs Review"),
         app_commands.Choice(name="Shortlisted", value="Shortlisted"),
+        app_commands.Choice(name="Processed", value="Processed"),
         app_commands.Choice(name="Contacted", value="Contacted"),
         app_commands.Choice(name="Signed", value="Signed"),
         app_commands.Choice(name="Approved", value="Approved"),

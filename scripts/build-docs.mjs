@@ -138,6 +138,14 @@ function convertComponents(source, stashHtml) {
   let text = source;
 
   text = text.replace(
+    /<Button\s+([^>]*)>([\s\S]*?)<\/Button>/g,
+    (_match, attrs, body) => {
+      const href = attrValue(attrs, "href") || "#";
+      return stashHtml(`<a class="doc-button" href="${escapeHtml(href)}">${renderInline(body.trim())}</a>`);
+    },
+  );
+
+  text = text.replace(
     /<CardGroup[^>]*>([\s\S]*?)<\/CardGroup>/g,
     (_match, body) => {
       const cards = [];
@@ -587,6 +595,23 @@ a { color: inherit; }
   color: var(--brand-light);
   text-decoration: none;
   border-bottom: 1px solid rgba(34, 197, 94, 0.35);
+}
+.article .doc-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 40px;
+  margin: 10px 0 4px;
+  padding: 8px 14px;
+  border: 1px solid var(--brand);
+  border-radius: var(--radius);
+  background: var(--brand);
+  color: #04130a;
+  font-weight: 700;
+  text-decoration: none;
+}
+.article .doc-button:hover {
+  background: var(--brand-light);
 }
 .article code {
   background: #121a16;

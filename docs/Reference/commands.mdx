@@ -15,6 +15,7 @@ Every public LabelUtils slash command, grouped by who uses it. Run `/help` in Di
 | Command | Description |
 | --- | --- |
 | `/help` | Show the command list and setup steps inside Discord. |
+| `/invite` | Show a clickable invite link for adding LabelUtils to another server. |
 | `/premium` | See how to buy Pro for the current server. |
 | `/pro_status` | Check whether the current server has Pro. |
 
@@ -59,6 +60,7 @@ Available submission statuses:
 - In Queue
 - Needs Review
 - Shortlisted
+- Processed
 - Contacted
 - Signed
 - Approved
@@ -108,8 +110,8 @@ Staff submission cards also include **Approve**, **Reject**, and **DM** buttons.
 
 | Command | Description |
 | --- | --- |
-| `/ticket_channel channel:<channel>` | Set the private staff channel where ticket cards appear. |
-| `/ticket_panel channel:<channel>` | Post the public button panel users click to open tickets. |
+| `/ticket_channel channel:<channel>` | Set the separate private staff channel where ticket cards appear. This cannot be the demo submission staff channel. |
+| `/ticket_panel channel:<channel>` | Post the public button panel users click to open tickets. Requires `/ticket_channel` first. |
 | `/tickets status:<optional>` | List recent support tickets, optionally filtered by Open, Waiting, Answered, or Resolved. |
 | `/ticket_set ticket_id:<id> new_status:<status>` | Update a support ticket to Open, Waiting, Answered, or Resolved. |
 

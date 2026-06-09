@@ -8,3 +8,5 @@ venv/
 site-dist/
 package.json
 vercel.json
+scripts/
+docs/
