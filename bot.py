@@ -176,6 +176,38 @@ CREATE TABLE IF NOT EXISTS labelutils_pro_settings (
 );
 """
 
+MIGRATION_TABLES = [
+    (
+        "label_submissions",
+        [
+            "ticket_id", "user_id", "name", "discord_username", "track_name", "track_link",
+            "artist_names", "message", "staff_notes", "reviewer_id", "rating",
+            "shortlisted", "priority", "status", "created_at",
+        ],
+    ),
+    (
+        "labelutils_support_tickets",
+        [
+            "ticket_id", "user_id", "username", "subject", "message", "status",
+            "thread_id", "created_at", "updated_at",
+        ],
+    ),
+    (
+        "labelutils_guild_branding",
+        ["guild_id", "display_name", "tagline", "embed_color", "updated_by", "updated_at"],
+    ),
+    (
+        "labelutils_pro_settings",
+        [
+            "guild_id", "message_label", "message_placeholder", "approval_template",
+            "rejection_template", "cooldown_minutes", "max_submissions_per_user",
+            "duplicate_policy", "approved_channel_id", "rejected_channel_id", "footer_text",
+            "logo_url", "success_message", "rejection_reasons", "digest_channel_id",
+            "ticket_channel_id", "updated_by", "updated_at",
+        ],
+    ),
+]
+
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -422,7 +454,7 @@ def ensure_control_tables() -> None:
         logger.exception("Failed to ensure LabelUtils control tables.")
 
 
-def ensure_submission_table(database_url: str) -> bool:
+def ensure_submission_table(database_url: str | StorageContext) -> bool:
     try:
         with connect_db(database_url) as conn:
             with conn.cursor() as cur:
@@ -472,7 +504,95 @@ def ensure_submission_table(database_url: str) -> bool:
         return False
 
 
-def set_guild_database_url(guild_id: int, configured_by: int, database_url: str) -> bool:
+def same_storage_context(left: StorageContext | None, right: StorageContext | None) -> bool:
+    if not left or not right:
+        return False
+    return (
+        storage_url(left) == storage_url(right)
+        and (left.schema_name or "") == (right.schema_name or "")
+    )
+
+
+def fetch_table_rows(conn, table_name: str, columns: list[str]) -> list[tuple]:
+    query = sql.SQL("SELECT {} FROM {};").format(
+        sql.SQL(", ").join(sql.Identifier(column) for column in columns),
+        sql.Identifier(table_name),
+    )
+    with conn.cursor() as cur:
+        cur.execute(query)
+        return cur.fetchall()
+
+
+def replace_table_rows(conn, table_name: str, columns: list[str], rows: list[tuple]) -> None:
+    with conn.cursor() as cur:
+        cur.execute(sql.SQL("DELETE FROM {};").format(sql.Identifier(table_name)))
+        if not rows:
+            return
+        placeholders = sql.SQL(", ").join(sql.Placeholder() for _ in columns)
+        query = sql.SQL("INSERT INTO {} ({}) VALUES ({})").format(
+            sql.Identifier(table_name),
+            sql.SQL(", ").join(sql.Identifier(column) for column in columns),
+            placeholders,
+        )
+        cur.executemany(query, rows)
+
+
+def count_table_rows(conn, table_name: str) -> int:
+    with conn.cursor() as cur:
+        cur.execute(sql.SQL("SELECT COUNT(*) FROM {};").format(sql.Identifier(table_name)))
+        row = cur.fetchone()
+        return int(row[0] or 0) if row else 0
+
+
+def migrate_storage_data(source: StorageContext | None, target: StorageContext) -> bool:
+    if not source or same_storage_context(source, target):
+        return ensure_submission_table(target)
+    if not ensure_submission_table(source) or not ensure_submission_table(target):
+        return False
+
+    try:
+        with connect_db(source) as source_conn, connect_db(target) as target_conn:
+            expected_counts: dict[str, int] = {}
+            for table_name, columns in MIGRATION_TABLES:
+                rows = fetch_table_rows(source_conn, table_name, columns)
+                expected_counts[table_name] = len(rows)
+                replace_table_rows(target_conn, table_name, columns, rows)
+
+            for table_name, expected_count in expected_counts.items():
+                actual_count = count_table_rows(target_conn, table_name)
+                if actual_count != expected_count:
+                    logger.error(
+                        "Migration verification failed for %s: expected %s rows, got %s.",
+                        table_name,
+                        expected_count,
+                        actual_count,
+                    )
+                    raise RuntimeError(f"Migration verification failed for {table_name}.")
+        return True
+    except Exception:
+        logger.exception("Failed to migrate guild storage data.")
+        return False
+
+
+def drop_managed_schema(context: StorageContext | None) -> None:
+    if not context or context.storage_mode != "pooled" or not valid_schema_name(context.schema_name):
+        return
+    try:
+        with psycopg.connect(storage_url(context), connect_timeout=DB_TIMEOUT_SECONDS) as conn:
+            conn.execute(
+                sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE;").format(sql.Identifier(context.schema_name))
+            )
+    except Exception:
+        logger.exception("Failed to drop old managed schema %s.", context.schema_name)
+
+
+def set_guild_database_url(
+    guild_id: int,
+    configured_by: int,
+    database_url: str,
+    *,
+    migrate_existing: bool = True,
+) -> bool:
     if not DATABASE_URL:
         logger.warning("DATABASE_URL is missing; cannot store guild database settings.")
         return False
@@ -481,6 +601,12 @@ def set_guild_database_url(guild_id: int, configured_by: int, database_url: str)
         return False
 
     encrypted_database_url = encrypt_database_url(database_url)
+    old_context = get_guild_database_url(guild_id)
+    new_context = StorageContext(database_url)
+    if migrate_existing and not migrate_storage_data(old_context, new_context):
+        logger.warning("Refusing to switch guild %s to custom database because migration failed.", guild_id)
+        return False
+
     try:
         with connect_db(DATABASE_URL) as conn:
             with conn.cursor() as cur:
@@ -503,9 +629,11 @@ def set_guild_database_url(guild_id: int, configured_by: int, database_url: str)
                     """,
                     (guild_id, encrypted_database_url, configured_by),
                 )
-        guild_database_cache[guild_id] = StorageContext(database_url)
+        guild_database_cache[guild_id] = new_context
         guild_brand_cache.pop(guild_id, None)
         guild_pro_settings_cache.pop(guild_id, None)
+        if migrate_existing and old_context and not same_storage_context(old_context, new_context):
+            drop_managed_schema(old_context)
         return True
     except Exception:
         logger.exception("Failed to save guild database URL for %s.", guild_id)
@@ -571,6 +699,17 @@ def assign_pooled_guild_database(
 
     schema_name = guild_schema_name(guild_id)
     safe_label_name = truncate_text(label_name.strip() or f"Guild {guild_id}", 120)
+    old_context = get_guild_database_url(guild_id)
+    new_context = StorageContext(
+        POOL_DATABASE_URLS[pool_slot],
+        schema_name=schema_name,
+        storage_mode="pooled",
+        pool_slot=pool_slot,
+    )
+    if not migrate_storage_data(old_context, new_context):
+        logger.warning("Refusing to switch guild %s to pooled database because migration failed.", guild_id)
+        return False
+
     try:
         with connect_db(DATABASE_URL) as conn:
             with conn.cursor() as cur:
@@ -594,14 +733,11 @@ def assign_pooled_guild_database(
                     """,
                     (guild_id, pool_slot, schema_name, safe_label_name, configured_by),
                 )
-        guild_database_cache[guild_id] = StorageContext(
-            POOL_DATABASE_URLS[pool_slot],
-            schema_name=schema_name,
-            storage_mode="pooled",
-            pool_slot=pool_slot,
-        )
+        guild_database_cache[guild_id] = new_context
         guild_brand_cache.pop(guild_id, None)
         guild_pro_settings_cache.pop(guild_id, None)
+        if old_context and not same_storage_context(old_context, new_context):
+            drop_managed_schema(old_context)
         return ensure_submission_table(guild_database_cache[guild_id])
     except Exception:
         logger.exception("Failed to assign pooled database for guild %s.", guild_id)
@@ -2841,7 +2977,7 @@ class DatabaseSetupModal(discord.ui.Modal, title="Set Server Database"):
         saved = set_guild_database_url(interaction.guild_id, interaction.user.id, value)
         if saved:
             await interaction.followup.send(
-                "Database connected. New submissions for this server will use that Neon database.",
+                "Custom database connected. Existing LabelUtils data was migrated before switching.",
                 ephemeral=True,
             )
         else:
@@ -3227,7 +3363,7 @@ async def storage(interaction: discord.Interaction, region: app_commands.Choice[
         pool_slot=region.value,
     )
     await interaction.followup.send(
-        f"Managed storage moved to **{pool_region_name(region.value)}**."
+        f"Managed storage switched to **{pool_region_name(region.value)}**. Existing LabelUtils data was migrated before switching."
         if assigned
         else f"I could not assign **{pool_region_name(region.value)}**. Check that `POOL_DATABASE_URL_{region.value}` is configured.",
         ephemeral=True,

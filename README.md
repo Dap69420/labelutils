@@ -71,6 +71,8 @@ Pro is built for teams that want a fuller A&R workflow:
 - Storage region selection with `/storage`.
 - Optional custom Neon database with `/setup_db`.
 
+When a Pro server changes storage region or connects a custom database, LabelUtils migrates existing submissions, tickets, branding, and Pro settings before switching. Old managed storage is cleaned up after a successful move.
+
 ## Support Tickets
 
 Pro servers can run a normal ticket-tool style flow:
