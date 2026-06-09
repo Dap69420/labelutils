@@ -779,7 +779,7 @@ def get_guild_database_url(guild_id: int | None) -> StorageContext | None:
         return None
     if guild_id in guild_database_cache:
         return guild_database_cache[guild_id]
-    if not DATABASE_URL or not encryption_ready():
+    if not DATABASE_URL:
         guild_database_cache[guild_id] = None
         return None
 
@@ -811,6 +811,13 @@ def get_guild_database_url(guild_id: int | None) -> StorageContext | None:
                 pool_slot=int(pool_slot),
             )
         elif encrypted_database_url:
+            if not encryption_ready():
+                logger.warning(
+                    "CONFIG_ENCRYPTION_KEY is missing; cannot decrypt custom database URL for guild %s.",
+                    guild_id,
+                )
+                guild_database_cache[guild_id] = None
+                return None
             custom_url = decrypt_database_url(encrypted_database_url)
             database_context = StorageContext(custom_url) if custom_url else None
 
@@ -3437,12 +3444,16 @@ async def database_status(interaction: discord.Interaction):
         return
 
     await interaction.response.defer(ephemeral=True)
-    configured = database_configured_for_guild(interaction.guild_id)
-    text = (
-        "This server has a Neon database connected."
-        if configured
-        else "No storage is connected for this server. Run `/start`, or `/setup_db` for a custom Neon database."
-    )
+    database_context = get_guild_database_url(interaction.guild_id)
+    if database_context and database_context.storage_mode == "pooled":
+        text = (
+            f"This server uses managed **{pool_region_name(database_context.pool_slot)}** storage "
+            f"in schema `{database_context.schema_name}`."
+        )
+    elif database_context:
+        text = "This server uses a custom Pro Neon database."
+    else:
+        text = "No storage is connected for this server. Run `/start`, or `/setup_db` for a custom Neon database."
     await interaction.followup.send(text, ephemeral=True)
 
 
