@@ -31,7 +31,6 @@ logger = logging.getLogger("labelutils-bot")
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 CONFIG_ENCRYPTION_KEY = os.getenv("CONFIG_ENCRYPTION_KEY")
-CLEAR_GLOBAL_COMMANDS = os.getenv("CLEAR_GLOBAL_COMMANDS", "1").lower() not in {"0", "false", "no"}
 PREMIUM_CONTACT = os.getenv("PREMIUM_CONTACT", "Contact the bot owner to buy premium.")
 BOT_INVITE_URL = os.getenv(
     "BOT_INVITE_URL",
@@ -60,6 +59,16 @@ OWNER_USER_IDS = {
     for value in os.getenv("OWNER_USER_IDS", "").split(",")
     if value.strip().isdigit()
 }
+PREMIUM_PLAN_RANKS = {
+    "starter": 1,
+    "pro": 2,
+    "pro_plus": 3,
+}
+PREMIUM_PLAN_LABELS = {
+    "starter": "Starter",
+    "pro": "Pro",
+    "pro_plus": "Pro+",
+}
 try:
     DEFAULT_STAFF_CHANNEL_ID = int(os.getenv("STAFF_CHANNEL_ID", "0"))
 except ValueError:
@@ -68,6 +77,10 @@ try:
     DISCORD_GUILD_ID = int(os.getenv("DISCORD_GUILD_ID", "0"))
 except ValueError:
     DISCORD_GUILD_ID = 0
+try:
+    OWNER_GUILD_ID = int(os.getenv("OWNER_GUILD_ID", str(DISCORD_GUILD_ID or 0)))
+except ValueError:
+    OWNER_GUILD_ID = DISCORD_GUILD_ID
 
 COOLDOWN_MINUTES = 30
 DB_TIMEOUT_SECONDS = 8
@@ -114,6 +127,40 @@ LABEL_STATUSES = [
 ]
 TICKET_STATUSES = ["Open", "Waiting", "Answered", "Resolved"]
 
+STARTER_COMMAND_NAMES = {
+    "brand",
+    "brand_info",
+    "brand_clear",
+    "form",
+    "templates",
+    "limits",
+    "routing",
+    "extras",
+    "post_panel",
+}
+PRO_COMMAND_NAMES = {
+    "storage",
+    "setup_db",
+    "note",
+    "reviewer",
+    "shortlist",
+    "priority",
+    "rate",
+    "shortlisted",
+    "reasons",
+    "digest",
+    "analytics",
+    "export",
+    "ticket_panel",
+    "ticket_channel",
+    "tickets",
+    "ticket_set",
+}
+OWNER_COMMAND_NAMES = {"coupon", "pro_add", "pro_remove"}
+TIERED_COMMAND_NAMES = STARTER_COMMAND_NAMES | PRO_COMMAND_NAMES | OWNER_COMMAND_NAMES
+tiered_commands: dict[str, app_commands.Command] = {}
+command_visibility_synced_once = False
+
 SUBMISSIONS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS label_submissions (
     ticket_id TEXT PRIMARY KEY,
@@ -129,6 +176,9 @@ CREATE TABLE IF NOT EXISTS label_submissions (
     rating INTEGER,
     shortlisted BOOLEAN NOT NULL DEFAULT FALSE,
     priority BOOLEAN NOT NULL DEFAULT FALSE,
+    staff_channel_id BIGINT,
+    staff_message_id BIGINT,
+    thread_id BIGINT,
     status TEXT NOT NULL DEFAULT 'In Queue',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -188,7 +238,8 @@ MIGRATION_TABLES = [
         [
             "ticket_id", "user_id", "name", "discord_username", "track_name", "track_link",
             "artist_names", "message", "staff_notes", "reviewer_id", "rating",
-            "shortlisted", "priority", "status", "created_at",
+            "shortlisted", "priority", "staff_channel_id", "staff_message_id",
+            "thread_id", "status", "created_at",
         ],
     ),
     (
@@ -481,7 +532,10 @@ def ensure_submission_table(database_url: str | StorageContext) -> bool:
                     ADD COLUMN IF NOT EXISTS reviewer_id BIGINT,
                     ADD COLUMN IF NOT EXISTS rating INTEGER,
                     ADD COLUMN IF NOT EXISTS shortlisted BOOLEAN NOT NULL DEFAULT FALSE,
-                    ADD COLUMN IF NOT EXISTS priority BOOLEAN NOT NULL DEFAULT FALSE;
+                    ADD COLUMN IF NOT EXISTS priority BOOLEAN NOT NULL DEFAULT FALSE,
+                    ADD COLUMN IF NOT EXISTS staff_channel_id BIGINT,
+                    ADD COLUMN IF NOT EXISTS staff_message_id BIGINT,
+                    ADD COLUMN IF NOT EXISTS thread_id BIGINT;
                     """
                 )
                 cur.execute(
@@ -874,6 +928,25 @@ def user_is_bot_owner(user_id: int) -> bool:
     return user_id in OWNER_USER_IDS
 
 
+def normalize_premium_plan(plan: object) -> str:
+    value = str(plan or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if value in {"starter", "start", "basic", "liAte"}:
+        return "starter"
+    if value in {"pro_plus", "pro+", "plus", "proplus", "white_label", "whitelabel"}:
+        return "pro_plus"
+    if value in {"pro", "premium", "paid", "lifetime"}:
+        return "pro"
+    return "pro"
+
+
+def premium_plan_label(plan: object) -> str:
+    return PREMIUM_PLAN_LABELS.get(normalize_premium_plan(plan), "Pro")
+
+
+def premium_plan_rank(plan: object) -> int:
+    return PREMIUM_PLAN_RANKS.get(normalize_premium_plan(plan), 0)
+
+
 def get_premium_guild(guild_id: int | None) -> tuple | None:
     if not guild_id or not DATABASE_URL:
         return None
@@ -896,7 +969,18 @@ def get_premium_guild(guild_id: int | None) -> tuple | None:
 
 
 def guild_has_premium(guild_id: int | None) -> bool:
-    return bool(get_premium_guild(guild_id))
+    row = get_premium_guild(guild_id)
+    return bool(row and premium_plan_rank(row[0]) >= PREMIUM_PLAN_RANKS["starter"])
+
+
+def guild_has_pro(guild_id: int | None) -> bool:
+    row = get_premium_guild(guild_id)
+    return bool(row and premium_plan_rank(row[0]) >= PREMIUM_PLAN_RANKS["pro"])
+
+
+def guild_has_pro_plus(guild_id: int | None) -> bool:
+    row = get_premium_guild(guild_id)
+    return bool(row and premium_plan_rank(row[0]) >= PREMIUM_PLAN_RANKS["pro_plus"])
 
 
 def add_premium_guild(guild_id: int, plan: str, days: int, added_by: int) -> bool:
@@ -905,7 +989,7 @@ def add_premium_guild(guild_id: int, plan: str, days: int, added_by: int) -> boo
         return False
 
     safe_days = max(1, min(days, 3650))
-    safe_plan = truncate_text(plan.strip() or "premium", 80)
+    safe_plan = normalize_premium_plan(plan)
     try:
         with connect_db(DATABASE_URL) as conn:
             with conn.cursor() as cur:
@@ -951,7 +1035,7 @@ def create_premium_coupon(
         logger.warning("DATABASE_URL is missing; cannot create premium coupon.")
         return False, "Control database is not configured."
 
-    safe_plan = truncate_text(plan.strip() or "pro", 80)
+    safe_plan = normalize_premium_plan(plan)
     safe_days = max(1, min(days, 3650))
     safe_uses = max(1, min(uses, 10000))
     coupon_code = normalize_coupon_code(code or generate_coupon_code())
@@ -1006,6 +1090,7 @@ def redeem_premium_coupon(guild_id: int, code: str, redeemed_by: int) -> tuple[b
                     return False, "That premium coupon does not exist."
 
                 plan, days, uses_remaining = row
+                safe_plan = normalize_premium_plan(plan)
                 if int(uses_remaining or 0) <= 0:
                     return False, "That premium coupon has no uses remaining."
 
@@ -1024,7 +1109,7 @@ def redeem_premium_coupon(guild_id: int, code: str, redeemed_by: int) -> tuple[b
                         added_by = EXCLUDED.added_by,
                         updated_at = NOW();
                     """,
-                    (guild_id, plan, days, redeemed_by, days),
+                    (guild_id, safe_plan, days, redeemed_by, days),
                 )
                 cur.execute(
                     """
@@ -1035,7 +1120,7 @@ def redeem_premium_coupon(guild_id: int, code: str, redeemed_by: int) -> tuple[b
                     """,
                     (coupon_code,),
                 )
-        return True, f"Redeemed `{coupon_code}` for {days} day(s) of **{plan}** premium."
+        return True, f"Redeemed `{coupon_code}` for {days} day(s) of **{premium_plan_label(safe_plan)}**."
     except Exception:
         logger.exception("Failed to redeem premium coupon %s for guild %s.", coupon_code, guild_id)
         return False, "Could not redeem that coupon. Check the bot logs."
@@ -1147,7 +1232,10 @@ def fetch_legacy_guild_brand(guild_id: int) -> dict[str, object] | None:
 
 
 def get_guild_brand(guild_id: int | None) -> dict[str, object] | None:
-    if not guild_id or not guild_has_premium(guild_id):
+    if not guild_id:
+        return None
+    if not guild_has_premium(guild_id):
+        guild_brand_cache.pop(guild_id, None)
         return None
     if guild_id in guild_brand_cache:
         return guild_brand_cache[guild_id]
@@ -1193,6 +1281,37 @@ def get_guild_brand(guild_id: int | None) -> dict[str, object] | None:
     )
     guild_brand_cache[guild_id] = brand
     return brand
+
+
+def get_stored_guild_brand(guild_id: int | None) -> dict[str, object] | None:
+    if not guild_id:
+        return None
+
+    database_url = get_guild_database_url(guild_id)
+    if not database_url or not ensure_submission_table(database_url):
+        return None
+
+    try:
+        with connect_db(database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT display_name, tagline, embed_color
+                    FROM labelutils_guild_branding
+                    WHERE guild_id = %s;
+                    """,
+                    (guild_id,),
+                )
+                row = cur.fetchone()
+    except Exception:
+        logger.exception("Failed to fetch stored guild branding for %s.", guild_id)
+        return None
+
+    return (
+        {"display_name": row[0], "tagline": row[1], "embed_color": row[2]}
+        if row
+        else None
+    )
 
 
 def set_guild_brand(
@@ -1329,7 +1448,10 @@ def fetch_legacy_pro_settings(guild_id: int) -> dict[str, object]:
 
 def get_pro_settings(guild_id: int | None) -> dict[str, object]:
     settings = dict(DEFAULT_PRO_SETTINGS)
-    if not guild_id or not guild_has_premium(guild_id):
+    if not guild_id:
+        return settings
+    if not guild_has_premium(guild_id):
+        guild_pro_settings_cache.pop(guild_id, None)
         return settings
     if guild_id in guild_pro_settings_cache:
         settings.update(guild_pro_settings_cache[guild_id])
@@ -1491,6 +1613,40 @@ def save_submission_to_neon(
         return True
     except Exception:
         logger.exception("Failed to insert submission into Neon.")
+        return False
+
+
+def update_submission_discord_refs(
+    database_url: str | StorageContext | None,
+    ticket_id: str,
+    *,
+    staff_channel_id: int | None = None,
+    staff_message_id: int | None = None,
+    thread_id: int | None = None,
+) -> bool:
+    if not database_url:
+        return False
+    try:
+        with connect_db(database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE label_submissions
+                    SET staff_channel_id = COALESCE(%s, staff_channel_id),
+                        staff_message_id = COALESCE(%s, staff_message_id),
+                        thread_id = COALESCE(%s, thread_id)
+                    WHERE upper(ticket_id) = %s;
+                    """,
+                    (
+                        staff_channel_id,
+                        staff_message_id,
+                        thread_id,
+                        ticket_id.upper(),
+                    ),
+                )
+        return True
+    except Exception:
+        logger.exception("Failed to update Discord refs for submission %s.", ticket_id)
         return False
 
 
@@ -2253,7 +2409,7 @@ async def send_status_route(
 
 
 def submission_decision_view(guild_id: int | None, *, final_decision: bool = False) -> discord.ui.View:
-    view = ProDecisionButtonsView() if guild_has_premium(guild_id) else DecisionButtonsView()
+    view = ProDecisionButtonsView() if guild_has_pro(guild_id) else DecisionButtonsView()
     if final_decision:
         for item in view.children:
             if getattr(item, "custom_id", "") in {"submission:approve", "submission:reject"}:
@@ -2367,31 +2523,116 @@ async def set_bot_server_nickname(
         return "Bot nickname not changed because Discord returned an error."
 
 
+async def reset_inactive_pro_nickname(interaction: discord.Interaction) -> None:
+    if guild_has_premium(interaction.guild_id):
+        return
+    if not interaction.guild or not interaction.guild.me:
+        return
+
+    brand = get_stored_guild_brand(interaction.guild_id)
+    display_name = str((brand or {}).get("display_name") or "").strip()
+    if not display_name:
+        return
+
+    saved_nickname = truncate_text(display_name, 32)
+    if interaction.guild.me.nick != saved_nickname:
+        return
+
+    await set_bot_server_nickname(interaction, None)
+
+
 class LabelUtilsClient(discord.Client):
     async def setup_hook(self) -> None:
         self.add_view(ProDecisionButtonsView())
         self.add_view(SubmitPanelView())
         self.add_view(SupportTicketPanelView())
         self.add_view(SupportTicketButtonsView())
+        prepare_tiered_command_registry()
         command_names = ", ".join(command.name for command in tree.get_commands())
-        logger.info("Registering slash command(s): %s", command_names)
-        if DISCORD_GUILD_ID:
-            guild = discord.Object(id=DISCORD_GUILD_ID)
-            tree.copy_global_to(guild=guild)
-            synced = await tree.sync(guild=guild)
-            logger.info("Synced %s guild slash command(s) to %s.", len(synced), DISCORD_GUILD_ID)
-            if CLEAR_GLOBAL_COMMANDS:
-                tree.clear_commands(guild=None)
-                cleared = await tree.sync()
-                logger.info("Cleared global slash command(s); %s global command(s) remain.", len(cleared))
+        logger.info("Registering global slash command(s): %s", command_names)
+        synced = await tree.sync()
+        logger.info("Synced %s global slash command(s).", len(synced))
+        if OWNER_GUILD_ID:
+            await sync_command_visibility_for_guild(OWNER_GUILD_ID)
         else:
-            logger.warning("DISCORD_GUILD_ID is missing. Global slash command updates can take up to 1 hour.")
-            synced = await tree.sync()
-            logger.info("Synced %s global slash command(s).", len(synced))
+            logger.warning("OWNER_GUILD_ID is missing. Owner-only commands will not be visible in any guild.")
 
 
 client = LabelUtilsClient(intents=intents)
 tree = app_commands.CommandTree(client)
+
+
+def prepare_tiered_command_registry() -> None:
+    if tiered_commands:
+        return
+
+    for command_name in sorted(TIERED_COMMAND_NAMES):
+        command = tree.remove_command(command_name)
+        if command:
+            tiered_commands[command_name] = command
+        else:
+            logger.warning("Tiered command %s was not registered before visibility setup.", command_name)
+
+
+def tiered_command_names_for_guild(guild_id: int) -> list[str]:
+    names: set[str] = set()
+    premium_row = get_premium_guild(guild_id)
+    if premium_row:
+        rank = premium_plan_rank(premium_row[0])
+        if rank >= PREMIUM_PLAN_RANKS["starter"]:
+            names.update(STARTER_COMMAND_NAMES)
+        if rank >= PREMIUM_PLAN_RANKS["pro"]:
+            names.update(PRO_COMMAND_NAMES)
+    if OWNER_GUILD_ID and guild_id == OWNER_GUILD_ID:
+        names.update(OWNER_COMMAND_NAMES)
+    return sorted(names)
+
+
+async def sync_command_visibility_for_guild(guild_id: int) -> None:
+    if not guild_id:
+        return
+    if not tiered_commands:
+        prepare_tiered_command_registry()
+
+    guild = discord.Object(id=guild_id)
+    tree.clear_commands(guild=guild)
+
+    command_names = tiered_command_names_for_guild(guild_id)
+    for command_name in command_names:
+        command = tiered_commands.get(command_name)
+        if not command:
+            logger.warning("Cannot sync missing tiered command %s for guild %s.", command_name, guild_id)
+            continue
+        try:
+            tree.add_command(command, guild=guild, override=True)
+        except Exception:
+            logger.exception("Failed to add tiered command %s for guild %s.", command_name, guild_id)
+
+    try:
+        synced = await tree.sync(guild=guild)
+        logger.info(
+            "Synced %s guild slash command(s) to %s: %s",
+            len(synced),
+            guild_id,
+            ", ".join(command_names) if command_names else "none",
+        )
+    except Exception:
+        logger.exception("Failed to sync guild command visibility for guild %s.", guild_id)
+
+
+async def sync_all_guild_command_visibility() -> None:
+    global command_visibility_synced_once
+    if command_visibility_synced_once:
+        return
+    command_visibility_synced_once = True
+
+    seen_guild_ids: set[int] = set()
+    for guild in client.guilds:
+        seen_guild_ids.add(guild.id)
+        await sync_command_visibility_for_guild(guild.id)
+
+    if OWNER_GUILD_ID and OWNER_GUILD_ID not in seen_guild_ids:
+        await sync_command_visibility_for_guild(OWNER_GUILD_ID)
 
 
 @tree.error
@@ -2620,11 +2861,11 @@ class ProSubmissionStatusButton(discord.ui.Button):
         if not user_can_manage_submissions(interaction):
             await interaction.response.send_message("You do not have permission to use this.", ephemeral=True)
             return
-        if not guild_has_premium(interaction.guild_id):
-            await interaction.response.send_message("Quick status buttons are a Pro feature.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        if not guild_has_pro(interaction.guild_id):
+            await interaction.followup.send("Quick status buttons are a Pro feature.", ephemeral=True)
             return
 
-        await interaction.response.defer(ephemeral=True)
         ticket_id, _artist_id, track_name = submission_info_from_message(interaction.message)
         database_url = get_guild_database_url(interaction.guild_id)
         updated = update_submission_status(database_url, ticket_id, self.status_value)
@@ -2675,6 +2916,10 @@ class SupportTicketDmModal(discord.ui.Modal, title="DM Ticket User"):
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
+        if not guild_has_pro(interaction.guild_id):
+            await reset_inactive_pro_nickname(interaction)
+            await interaction.followup.send("Support tickets are a Pro feature.", ephemeral=True)
+            return
         ticket_id, user_id, subject = support_ticket_info_from_message(self.ticket_message)
         content = (
             f"Message from **{server_display_name(interaction)}** about your ticket "
@@ -2711,11 +2956,15 @@ class SupportTicketButtonsView(discord.ui.View):
 
     @discord.ui.button(label="Resolved", style=discord.ButtonStyle.green, custom_id="support_ticket:resolve")
     async def resolve_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        if not guild_has_pro(interaction.guild_id):
+            await reset_inactive_pro_nickname(interaction)
+            await interaction.followup.send("Support tickets are a Pro feature.", ephemeral=True)
+            return
         if not user_can_manage_submissions(interaction):
-            await interaction.response.send_message("You do not have permission to use this.", ephemeral=True)
+            await interaction.followup.send("You do not have permission to use this.", ephemeral=True)
             return
 
-        await interaction.response.defer(ephemeral=True)
         ticket_id, _user_id, _subject = support_ticket_info_from_message(interaction.message)
         database_url = get_guild_database_url(interaction.guild_id)
         updated = update_support_ticket_status(database_url, ticket_id, "Resolved")
@@ -3043,20 +3292,21 @@ class DatabaseSetupModal(discord.ui.Modal, title="Set Server Database"):
                 ephemeral=True,
             )
             return
-        if not guild_has_premium(interaction.guild_id):
-            await interaction.response.send_message(
-                "Custom Neon databases are a Pro feature. Free servers can use `/start` for managed storage.",
+        await interaction.response.defer(ephemeral=True)
+        if not guild_has_pro(interaction.guild_id):
+            await interaction.followup.send(
+                "Custom Neon databases are a Pro feature. Free and Starter servers can use `/start` for managed storage.",
                 ephemeral=True,
             )
             return
         if not DATABASE_URL:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "The bot owner has not configured the control DATABASE_URL.",
                 ephemeral=True,
             )
             return
         if not encryption_ready():
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "The bot owner has not configured CONFIG_ENCRYPTION_KEY.",
                 ephemeral=True,
             )
@@ -3064,13 +3314,12 @@ class DatabaseSetupModal(discord.ui.Modal, title="Set Server Database"):
 
         value = self.database_url.value.strip()
         if not is_valid_database_url(value):
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "Please enter a valid PostgreSQL/Neon connection URL.",
                 ephemeral=True,
             )
             return
 
-        await interaction.response.defer(ephemeral=True)
         if not ensure_submission_table(value):
             await interaction.followup.send(
                 "I could not connect to that database or create the submissions table.",
@@ -3120,14 +3369,22 @@ class AdvancedSubmissionModal(discord.ui.Modal, title="New Label Submission"):
         required=False,
     )
 
-    def __init__(self, guild_id: int | None = None):
+    def __init__(self, guild_id: int | None = None, requires_premium: bool = False):
         super().__init__()
+        self.requires_premium = requires_premium
         settings = cached_submission_form_settings(guild_id)
         self.message.label = truncate_text(settings["message_label"], 45)
         self.message.placeholder = truncate_text(settings["message_placeholder"], 100)
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
+        if self.requires_premium and not guild_has_premium(interaction.guild_id):
+            await reset_inactive_pro_nickname(interaction)
+            await interaction.followup.send(
+                "This premium submit panel is inactive because this server does not currently have Starter, Pro, or Pro+. Use `/submit` instead.",
+                ephemeral=True,
+            )
+            return
         database_url = get_guild_database_url(interaction.guild_id)
         if not database_url:
             await interaction.followup.send(
@@ -3235,6 +3492,12 @@ class AdvancedSubmissionModal(discord.ui.Modal, title="New Label Submission"):
         embed.set_footer(text=f"{footer_text} | {status_text} | Pending Action")
 
         staff_message = await channel.send(embed=embed, view=submission_decision_view(interaction.guild_id))
+        update_submission_discord_refs(
+            database_url,
+            ticket_id,
+            staff_channel_id=channel.id,
+            staff_message_id=staff_message.id,
+        )
         set_submission_cooldown(artist_id, int(settings.get("cooldown_minutes") or COOLDOWN_MINUTES))
         success_text = format_template(
             settings.get("success_message"),
@@ -3252,6 +3515,7 @@ class AdvancedSubmissionModal(discord.ui.Modal, title="New Label Submission"):
         if thread:
             embed.add_field(name="Thread ID", value=str(thread.id), inline=False)
             await staff_message.edit(embed=embed, view=submission_decision_view(interaction.guild_id))
+            update_submission_discord_refs(database_url, ticket_id, thread_id=thread.id)
             await thread.send(
                 "Release log: submission received and staff card created."
             )
@@ -3265,7 +3529,9 @@ async def submit(interaction: discord.Interaction):
 @tree.command(name="help", description="Show LabelUtils commands and setup steps")
 async def help_command(interaction: discord.Interaction):
     logger.info("Received /help from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
-    premium_active = guild_has_premium(interaction.guild_id)
+    await interaction.response.defer(ephemeral=True)
+    premium_row = get_premium_guild(interaction.guild_id)
+    premium_name = premium_plan_label(premium_row[0]) if premium_row else "not active"
     embed = discord.Embed(
         title="LabelUtils Help",
         description=(
@@ -3296,11 +3562,11 @@ async def help_command(interaction: discord.Interaction):
         inline=False,
     )
     embed.add_field(
-        name="Pro",
+        name="Premium",
         value=(
             "`/premium` and `/redeem` - upgrade this server\n"
-            "`/brand`, `/templates`, `/limits`, `/routing` - customize workflows\n"
-            "`/shortlist`, `/priority`, `/rate`, `/reasons`, `/digest` - A&R tools\n"
+            "`/brand`, `/templates`, `/limits`, `/routing` - Starter customization\n"
+            "`/shortlist`, `/priority`, `/rate`, `/reasons`, `/digest` - Pro A&R tools\n"
             "`/storage` - choose West US, Europe (UK), or South-East Asia storage\n"
             "`/ticket_channel`, `/ticket_panel`, `/tickets`, `/ticket_set` - support tickets"
         ),
@@ -3311,8 +3577,8 @@ async def help_command(interaction: discord.Interaction):
         value="Full setup guides and command reference: https://labelutils.dapmedia.tech",
         inline=False,
     )
-    embed.set_footer(text=f"Premium: {'active' if premium_active else 'not active'}")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    embed.set_footer(text=f"Premium: {premium_name}")
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 @tree.command(name="invite", description="Get the LabelUtils invite link")
@@ -3329,7 +3595,7 @@ class SubmitPanelView(discord.ui.View):
 
     @discord.ui.button(label="Submit Demo", style=discord.ButtonStyle.blurple, custom_id="submit_panel:open")
     async def submit_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(AdvancedSubmissionModal(interaction.guild_id))
+        await interaction.response.send_modal(AdvancedSubmissionModal(interaction.guild_id, requires_premium=True))
 
 
 class SupportTicketModal(discord.ui.Modal, title="Open Ticket"):
@@ -3349,6 +3615,13 @@ class SupportTicketModal(discord.ui.Modal, title="Open Ticket"):
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
+        if not guild_has_pro(interaction.guild_id):
+            await reset_inactive_pro_nickname(interaction)
+            await interaction.followup.send(
+                "Support tickets are a Pro feature. This ticket panel is inactive because Pro is not active.",
+                ephemeral=True,
+            )
+            return
         database_url = get_guild_database_url(interaction.guild_id)
         if not database_url:
             await interaction.followup.send("This server has not connected a database yet.", ephemeral=True)
@@ -3423,8 +3696,16 @@ class SupportTicketPanelView(discord.ui.View):
 def require_pro_admin(interaction: discord.Interaction) -> str | None:
     if not user_is_admin(interaction):
         return "Only administrators can use this Pro setup command."
+    if not guild_has_pro(interaction.guild_id):
+        return "This is a Pro feature. Starter does not include it. Use `/premium` to see upgrade options."
+    return None
+
+
+def require_starter_admin(interaction: discord.Interaction) -> str | None:
+    if not user_is_admin(interaction):
+        return "Only administrators can use this premium setup command."
     if not guild_has_premium(interaction.guild_id):
-        return "This is a Pro feature. Use `/premium` to see how to upgrade."
+        return "This is a Starter feature. Use `/premium` to see upgrade options."
     return None
 
 
@@ -3477,13 +3758,13 @@ async def start(interaction: discord.Interaction, label_name: str):
 )
 async def storage(interaction: discord.Interaction, region: app_commands.Choice[int]):
     logger.info("Received /storage from guild=%s user=%s region=%s.", interaction.guild_id, interaction.user.id, region.value)
+    await interaction.response.defer(ephemeral=True)
     error = require_pro_admin(interaction)
     if error:
-        await interaction.response.send_message(error, ephemeral=True)
+        await interaction.followup.send(error, ephemeral=True)
         return
 
     label_name = interaction.guild.name if interaction.guild else f"Guild {interaction.guild_id}"
-    await interaction.response.defer(ephemeral=True)
     assigned = assign_pooled_guild_database(
         interaction.guild_id,
         interaction.user.id,
@@ -3504,12 +3785,6 @@ async def setup_database(interaction: discord.Interaction):
     if not user_is_admin(interaction):
         await interaction.response.send_message(
             "Only administrators can configure the server database.",
-            ephemeral=True,
-        )
-        return
-    if not guild_has_premium(interaction.guild_id):
-        await interaction.response.send_message(
-            "Custom Neon databases are a Pro feature. Free servers should use `/start`.",
             ephemeral=True,
         )
         return
@@ -3634,7 +3909,7 @@ async def setup_status(interaction: discord.Interaction):
     else:
         database_status_text = "Not connected"
     premium = get_premium_guild(interaction.guild_id)
-    premium_status = f"{premium[0]} until {discord_timestamp(premium[1])}" if premium else "Not active"
+    premium_status = f"{premium_plan_label(premium[0])} until {discord_timestamp(premium[1])}" if premium else "Not active"
     pro_settings = get_pro_settings(interaction.guild_id)
     ticket_channel_id = int(pro_settings.get("ticket_channel_id") or 0)
     ticket_channel = client.get_channel(ticket_channel_id) if ticket_channel_id else None
@@ -3677,38 +3952,50 @@ async def setup_status(interaction: discord.Interaction):
         inline=False,
     )
     embed.add_field(name="Submission Threads", value=thread_status, inline=False)
-    embed.set_footer(text="Run /start and /setup_staff to complete setup. Pro can use /storage or /setup_db.")
+    embed.set_footer(text="Run /start and /setup_staff to complete setup. Starter customizes branding; Pro adds storage and workflow tools.")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 @tree.command(name="premium", description="See how to buy LabelUtils premium")
 async def premium(interaction: discord.Interaction):
     logger.info("Received /premium from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    await interaction.response.defer(ephemeral=True)
     premium_row = get_premium_guild(interaction.guild_id)
     embed = discord.Embed(title="LabelUtils Premium", color=0xF1C40F)
     if premium_row:
         plan, expires_at = premium_row
-        embed.description = f"This server has the **{plan}** plan until {discord_timestamp(expires_at)}."
+        embed.description = f"This server has the **{premium_plan_label(plan)}** plan until {discord_timestamp(expires_at)}."
     else:
         embed.description = PREMIUM_CONTACT
+    embed.add_field(
+        name="Tiers",
+        value=(
+            "**Starter**: branding, panels, templates, form text, limits, routing, and extras.\n"
+            "**Pro**: Starter plus storage options, A&R tools, analytics/export, and support tickets.\n"
+            "**Pro+**: currently same features as Pro while white-label hosting is prepared."
+        ),
+        inline=False,
+    )
     embed.add_field(
         name="How it works",
         value="Contact the owner, complete payment, then premium is enabled manually for this server.",
         inline=False,
     )
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 @tree.command(name="pro_status", description="Check this server's premium status")
 async def premium_status(interaction: discord.Interaction):
     logger.info("Received /premium_status from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    await interaction.response.defer(ephemeral=True)
     premium_row = get_premium_guild(interaction.guild_id)
     if premium_row:
         plan, expires_at = premium_row
-        text = f"This server has **{plan}** premium until {discord_timestamp(expires_at)}."
+        text = f"This server has **{premium_plan_label(plan)}** until {discord_timestamp(expires_at)}."
     else:
+        await reset_inactive_pro_nickname(interaction)
         text = f"This server does not have premium.\n{PREMIUM_CONTACT}"
-    await interaction.response.send_message(text, ephemeral=True)
+    await interaction.followup.send(text, ephemeral=True)
 
 
 @tree.command(name="redeem", description="Admin: redeem a premium coupon for this server")
@@ -3724,6 +4011,8 @@ async def premium_redeem(interaction: discord.Interaction, code: str):
 
     await interaction.response.defer(ephemeral=True)
     redeemed, message = redeem_premium_coupon(interaction.guild_id, code, interaction.user.id)
+    if redeemed and interaction.guild_id:
+        await sync_command_visibility_for_guild(interaction.guild_id)
     await interaction.followup.send(message if redeemed else f"Could not redeem coupon: {message}", ephemeral=True)
 
 
@@ -3731,8 +4020,15 @@ async def premium_redeem(interaction: discord.Interaction, code: str):
 @app_commands.describe(
     days="Premium days granted per redemption",
     uses="How many times this coupon can be redeemed",
-    plan="Plan name, such as pro",
+    plan="Premium tier",
     code="Optional custom coupon code",
+)
+@app_commands.choices(
+    plan=[
+        app_commands.Choice(name="Starter", value="starter"),
+        app_commands.Choice(name="Pro", value="pro"),
+        app_commands.Choice(name="Pro+", value="pro_plus"),
+    ]
 )
 async def premium_coupon_create(
     interaction: discord.Interaction,
@@ -3753,7 +4049,7 @@ async def premium_coupon_create(
     created, result = create_premium_coupon(plan, days, uses, interaction.user.id, code or None)
     if created:
         await interaction.followup.send(
-            f"Premium coupon created: `{result}`\nPlan: `{plan}` | Days/use: `{days}` | Uses: `{uses}`",
+            f"Premium coupon created: `{result}`\nPlan: `{premium_plan_label(plan)}` | Days/use: `{days}` | Uses: `{uses}`",
             ephemeral=True,
         )
     else:
@@ -3764,7 +4060,14 @@ async def premium_coupon_create(
 @app_commands.describe(
     guild_id="Discord server ID to grant premium to",
     days="Number of days to add",
-    plan="Plan name, such as pro, premium, or lifetime",
+    plan="Premium tier",
+)
+@app_commands.choices(
+    plan=[
+        app_commands.Choice(name="Starter", value="starter"),
+        app_commands.Choice(name="Pro", value="pro"),
+        app_commands.Choice(name="Pro+", value="pro_plus"),
+    ]
 )
 async def premium_add(
     interaction: discord.Interaction,
@@ -3787,8 +4090,10 @@ async def premium_add(
 
     await interaction.response.defer(ephemeral=True)
     saved = add_premium_guild(parsed_guild_id, plan, days, interaction.user.id)
+    if saved:
+        await sync_command_visibility_for_guild(parsed_guild_id)
     text = (
-        f"Premium granted to `{parsed_guild_id}` for {days} day(s) on plan `{plan}`."
+        f"Premium granted to `{parsed_guild_id}` for {days} day(s) on plan `{premium_plan_label(plan)}`."
         if saved
         else "Could not save premium. Check the control database logs."
     )
@@ -3810,6 +4115,8 @@ async def premium_remove(interaction: discord.Interaction, guild_id: str):
 
     await interaction.response.defer(ephemeral=True)
     removed = remove_premium_guild(parsed_guild_id)
+    if removed:
+        await sync_command_visibility_for_guild(parsed_guild_id)
     text = (
         f"Premium removed from `{parsed_guild_id}`."
         if removed
@@ -3849,6 +4156,11 @@ class BrandSetupModal(discord.ui.Modal, title="Setup Pro Branding"):
             return
 
         await interaction.response.defer(ephemeral=True)
+        error = require_starter_admin(interaction)
+        if error:
+            await interaction.followup.send(error, ephemeral=True)
+            return
+
         saved = set_guild_brand(
             interaction.guild_id,
             interaction.user.id,
@@ -3873,7 +4185,7 @@ class BrandSetupModal(discord.ui.Modal, title="Setup Pro Branding"):
         await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@tree.command(name="brand", description="Pro: customize this server's LabelUtils branding")
+@tree.command(name="brand", description="Starter: customize this server's LabelUtils branding")
 async def setup_brand(interaction: discord.Interaction):
     logger.info("Received /setup_brand from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
     if not interaction.guild_id:
@@ -3882,17 +4194,11 @@ async def setup_brand(interaction: discord.Interaction):
     if not user_is_admin(interaction):
         await interaction.response.send_message("Only administrators can configure branding.", ephemeral=True)
         return
-    if not guild_has_premium(interaction.guild_id):
-        await interaction.response.send_message(
-            "This is a Pro feature. Use `/premium` to see how to upgrade.",
-            ephemeral=True,
-        )
-        return
 
     await interaction.response.send_modal(BrandSetupModal())
 
 
-@tree.command(name="brand_info", description="Show this server's Pro branding")
+@tree.command(name="brand_info", description="Show this server's premium branding")
 async def brand_status(interaction: discord.Interaction):
     logger.info("Received /brand_status from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
     await interaction.response.defer(ephemeral=True)
@@ -3901,7 +4207,7 @@ async def brand_status(interaction: discord.Interaction):
     embed = discord.Embed(title="Brand Status", color=server_embed_color(interaction))
     embed.add_field(
         name="Premium",
-        value=f"{premium_row[0]} until {discord_timestamp(premium_row[1])}" if premium_row else "Not active",
+        value=f"{premium_plan_label(premium_row[0])} until {discord_timestamp(premium_row[1])}" if premium_row else "Not active",
         inline=False,
     )
     embed.add_field(name="Display Name", value=server_display_name(interaction), inline=False)
@@ -3919,7 +4225,7 @@ async def brand_status(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@tree.command(name="brand_clear", description="Pro: reset this server's custom branding")
+@tree.command(name="brand_clear", description="Starter: reset this server's custom branding")
 async def brand_reset(interaction: discord.Interaction):
     logger.info("Received /brand_reset from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
     if not interaction.guild_id:
@@ -3928,14 +4234,14 @@ async def brand_reset(interaction: discord.Interaction):
     if not user_is_admin(interaction):
         await interaction.response.send_message("Only administrators can reset branding.", ephemeral=True)
         return
+    await interaction.response.defer(ephemeral=True)
     if not guild_has_premium(interaction.guild_id):
-        await interaction.response.send_message(
-            "This is a Pro feature. Use `/premium` to see how to upgrade.",
+        await interaction.followup.send(
+            "This is a Starter feature. Use `/premium` to see upgrade options.",
             ephemeral=True,
         )
         return
 
-    await interaction.response.defer(ephemeral=True)
     reset = reset_guild_brand(interaction.guild_id)
     nickname_status = await set_bot_server_nickname(interaction, None) if reset else ""
     await interaction.followup.send(
@@ -3944,16 +4250,17 @@ async def brand_reset(interaction: discord.Interaction):
     )
 
 
-@tree.command(name="form", description="Pro: customize the optional submission question")
+@tree.command(name="form", description="Starter: customize the optional submission question")
 @app_commands.describe(
     label="Label for the final optional form field",
     placeholder="Placeholder text for that field",
 )
 async def setup_form(interaction: discord.Interaction, label: str, placeholder: str):
     logger.info("Received /setup_form from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
-    error = require_pro_admin(interaction)
+    await interaction.response.defer(ephemeral=True)
+    error = require_starter_admin(interaction)
     if error:
-        await interaction.response.send_message(error, ephemeral=True)
+        await interaction.followup.send(error, ephemeral=True)
         return
 
     saved = upsert_pro_settings(
@@ -3962,7 +4269,7 @@ async def setup_form(interaction: discord.Interaction, label: str, placeholder: 
         message_label=truncate_text(label, 45),
         message_placeholder=truncate_text(placeholder, 100),
     )
-    await interaction.response.send_message(
+    await interaction.followup.send(
         "Submission form prompt updated." if saved else "I could not save the form settings.",
         ephemeral=True,
     )
@@ -3985,6 +4292,12 @@ class TemplateSetupModal(discord.ui.Modal, title="Setup DM Templates"):
     )
 
     async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        error = require_starter_admin(interaction)
+        if error:
+            await interaction.followup.send(error, ephemeral=True)
+            return
+
         updates = {}
         approval_value = self.approval_template.value.strip()
         rejection_value = self.rejection_template.value.strip()
@@ -3994,29 +4307,28 @@ class TemplateSetupModal(discord.ui.Modal, title="Setup DM Templates"):
             updates["rejection_template"] = truncate_text(rejection_value, 1500)
 
         if not updates:
-            await interaction.response.send_message("No template changes were submitted.", ephemeral=True)
+            await interaction.followup.send("No template changes were submitted.", ephemeral=True)
             return
 
         saved = upsert_pro_settings(interaction.guild_id, interaction.user.id, **updates)
         changed = ", ".join(key.replace("_template", "") for key in updates)
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"Updated {changed} template(s)." if saved else "I could not save the DM templates.",
             ephemeral=True,
         )
 
 
-@tree.command(name="templates", description="Pro: customize approval and rejection DMs")
+@tree.command(name="templates", description="Starter: customize approval and rejection DMs")
 async def setup_templates(interaction: discord.Interaction):
     logger.info("Received /setup_templates from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
-    error = require_pro_admin(interaction)
-    if error:
-        await interaction.response.send_message(error, ephemeral=True)
+    if not user_is_admin(interaction):
+        await interaction.response.send_message("Only administrators can use this premium setup command.", ephemeral=True)
         return
 
     await interaction.response.send_modal(TemplateSetupModal())
 
 
-@tree.command(name="limits", description="Pro: configure cooldowns, submission caps, and duplicate policy")
+@tree.command(name="limits", description="Starter: configure cooldowns, submission caps, and duplicate policy")
 @app_commands.describe(
     cooldown_minutes="Minutes users must wait between submissions",
     max_submissions_per_user="0 means unlimited total submissions per user",
@@ -4035,9 +4347,10 @@ async def setup_limits(
     duplicate_policy: app_commands.Choice[str],
 ):
     logger.info("Received /setup_limits from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
-    error = require_pro_admin(interaction)
+    await interaction.response.defer(ephemeral=True)
+    error = require_starter_admin(interaction)
     if error:
-        await interaction.response.send_message(error, ephemeral=True)
+        await interaction.followup.send(error, ephemeral=True)
         return
 
     saved = upsert_pro_settings(
@@ -4047,13 +4360,13 @@ async def setup_limits(
         max_submissions_per_user=max(0, min(max_submissions_per_user, 10000)),
         duplicate_policy=duplicate_policy.value,
     )
-    await interaction.response.send_message(
+    await interaction.followup.send(
         "Submission limits updated." if saved else "I could not save submission limits.",
         ephemeral=True,
     )
 
 
-@tree.command(name="routing", description="Pro: route approved/rejected updates to channels")
+@tree.command(name="routing", description="Starter: route approved/rejected updates to channels")
 @app_commands.describe(
     approved_channel="Optional channel for approved submission updates",
     rejected_channel="Optional channel for rejected submission updates",
@@ -4064,9 +4377,10 @@ async def setup_routing(
     rejected_channel: discord.TextChannel | None = None,
 ):
     logger.info("Received /setup_routing from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
-    error = require_pro_admin(interaction)
+    await interaction.response.defer(ephemeral=True)
+    error = require_starter_admin(interaction)
     if error:
-        await interaction.response.send_message(error, ephemeral=True)
+        await interaction.followup.send(error, ephemeral=True)
         return
 
     saved = upsert_pro_settings(
@@ -4075,13 +4389,13 @@ async def setup_routing(
         approved_channel_id=approved_channel.id if approved_channel else 0,
         rejected_channel_id=rejected_channel.id if rejected_channel else 0,
     )
-    await interaction.response.send_message(
+    await interaction.followup.send(
         "Routing updated." if saved else "I could not save routing settings.",
         ephemeral=True,
     )
 
 
-@tree.command(name="extras", description="Pro: set footer, logo, and submit success text")
+@tree.command(name="extras", description="Starter: set footer, logo, and submit success text")
 @app_commands.describe(
     footer_text="Footer prefix on staff submission cards",
     logo_url="Image URL used as submission thumbnail, or none",
@@ -4094,12 +4408,13 @@ async def setup_brand_extras(
     success_message: str,
 ):
     logger.info("Received /setup_brand_extras from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
-    error = require_pro_admin(interaction)
+    await interaction.response.defer(ephemeral=True)
+    error = require_starter_admin(interaction)
     if error:
-        await interaction.response.send_message(error, ephemeral=True)
+        await interaction.followup.send(error, ephemeral=True)
         return
     if logo_url and logo_url.lower() != "none" and not is_valid_url(logo_url):
-        await interaction.response.send_message("Logo URL must be a valid http(s) URL or `none`.", ephemeral=True)
+        await interaction.followup.send("Logo URL must be a valid http(s) URL or `none`.", ephemeral=True)
         return
 
     saved = upsert_pro_settings(
@@ -4109,17 +4424,17 @@ async def setup_brand_extras(
         logo_url="" if logo_url.lower() == "none" else truncate_text(logo_url, 500),
         success_message=truncate_text(success_message, 500),
     )
-    await interaction.response.send_message(
+    await interaction.followup.send(
         "Brand extras updated." if saved else "I could not save brand extras.",
         ephemeral=True,
     )
 
 
-@tree.command(name="post_panel", description="Pro: post a branded submit button panel")
+@tree.command(name="post_panel", description="Starter: post a branded submit button panel")
 async def post_submit_panel(interaction: discord.Interaction):
     logger.info("Received /post_submit_panel from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
     await interaction.response.defer()
-    error = require_pro_admin(interaction)
+    error = require_starter_admin(interaction)
     if error:
         await interaction.followup.send(error, ephemeral=True)
         return
@@ -4139,11 +4454,11 @@ async def staff_note(interaction: discord.Interaction, ticket_id: str, note: str
     if not user_can_manage_submissions(interaction):
         await interaction.response.send_message("You do not have permission to use this.", ephemeral=True)
         return
-    if not guild_has_premium(interaction.guild_id):
-        await interaction.response.send_message("This is a Pro feature.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    if not guild_has_pro(interaction.guild_id):
+        await interaction.followup.send("This is a Pro feature. Starter does not include it.", ephemeral=True)
         return
 
-    await interaction.response.defer(ephemeral=True)
     database_url = get_guild_database_url(interaction.guild_id)
     if not database_url:
         await interaction.followup.send("This server has not connected a submissions database yet.", ephemeral=True)
@@ -4169,11 +4484,11 @@ async def assign_reviewer_command(interaction: discord.Interaction, ticket_id: s
     if not user_can_manage_submissions(interaction):
         await interaction.response.send_message("You do not have permission to use this.", ephemeral=True)
         return
-    if not guild_has_premium(interaction.guild_id):
-        await interaction.response.send_message("This is a Pro feature.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    if not guild_has_pro(interaction.guild_id):
+        await interaction.followup.send("This is a Pro feature. Starter does not include it.", ephemeral=True)
         return
 
-    await interaction.response.defer(ephemeral=True)
     database_url = get_guild_database_url(interaction.guild_id)
     if not database_url:
         await interaction.followup.send("This server has not connected a submissions database yet.", ephemeral=True)
@@ -4199,11 +4514,11 @@ async def shortlist(interaction: discord.Interaction, ticket_id: str, enabled: b
     if not user_can_manage_submissions(interaction):
         await interaction.response.send_message("You do not have permission to use this.", ephemeral=True)
         return
-    if not guild_has_premium(interaction.guild_id):
-        await interaction.response.send_message("This is a Pro feature.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    if not guild_has_pro(interaction.guild_id):
+        await interaction.followup.send("This is a Pro feature. Starter does not include it.", ephemeral=True)
         return
 
-    await interaction.response.defer(ephemeral=True)
     database_url = get_guild_database_url(interaction.guild_id)
     ensure_submission_table(database_url) if database_url else None
     normalized_ticket_id = normalize_ticket_id(ticket_id)
@@ -4225,11 +4540,11 @@ async def priority(interaction: discord.Interaction, ticket_id: str, enabled: bo
     if not user_can_manage_submissions(interaction):
         await interaction.response.send_message("You do not have permission to use this.", ephemeral=True)
         return
-    if not guild_has_premium(interaction.guild_id):
-        await interaction.response.send_message("This is a Pro feature.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    if not guild_has_pro(interaction.guild_id):
+        await interaction.followup.send("This is a Pro feature. Starter does not include it.", ephemeral=True)
         return
 
-    await interaction.response.defer(ephemeral=True)
     database_url = get_guild_database_url(interaction.guild_id)
     ensure_submission_table(database_url) if database_url else None
     normalized_ticket_id = normalize_ticket_id(ticket_id)
@@ -4249,14 +4564,14 @@ async def rate(interaction: discord.Interaction, ticket_id: str, score: int):
     if not user_can_manage_submissions(interaction):
         await interaction.response.send_message("You do not have permission to use this.", ephemeral=True)
         return
-    if not guild_has_premium(interaction.guild_id):
-        await interaction.response.send_message("This is a Pro feature.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    if not guild_has_pro(interaction.guild_id):
+        await interaction.followup.send("This is a Pro feature. Starter does not include it.", ephemeral=True)
         return
     if score < 1 or score > 10:
-        await interaction.response.send_message("Score must be between 1 and 10.", ephemeral=True)
+        await interaction.followup.send("Score must be between 1 and 10.", ephemeral=True)
         return
 
-    await interaction.response.defer(ephemeral=True)
     database_url = get_guild_database_url(interaction.guild_id)
     ensure_submission_table(database_url) if database_url else None
     normalized_ticket_id = normalize_ticket_id(ticket_id)
@@ -4275,11 +4590,11 @@ async def shortlisted(interaction: discord.Interaction):
     if not user_can_manage_submissions(interaction):
         await interaction.response.send_message("You do not have permission to use this.", ephemeral=True)
         return
-    if not guild_has_premium(interaction.guild_id):
-        await interaction.response.send_message("This is a Pro feature.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    if not guild_has_pro(interaction.guild_id):
+        await interaction.followup.send("This is a Pro feature. Starter does not include it.", ephemeral=True)
         return
 
-    await interaction.response.defer(ephemeral=True)
     database_url = get_guild_database_url(interaction.guild_id)
     ensure_submission_table(database_url) if database_url else None
     rows = fetch_shortlisted_submissions(database_url)
@@ -4290,15 +4605,16 @@ async def shortlisted(interaction: discord.Interaction):
 @app_commands.describe(reasons="Separate reasons with |, or leave blank to view current reasons")
 async def reasons(interaction: discord.Interaction, reasons: str = ""):
     logger.info("Received /reasons from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    await interaction.response.defer(ephemeral=True)
     error = require_pro_admin(interaction)
     if error:
-        await interaction.response.send_message(error, ephemeral=True)
+        await interaction.followup.send(error, ephemeral=True)
         return
 
     if not reasons.strip():
         current = parse_rejection_reasons(get_pro_settings(interaction.guild_id))
         text = "\n".join(f"- {reason}" for reason in current) if current else "No saved rejection reasons yet."
-        await interaction.response.send_message(text, ephemeral=True)
+        await interaction.followup.send(text, ephemeral=True)
         return
 
     cleaned = " | ".join(
@@ -4307,7 +4623,7 @@ async def reasons(interaction: discord.Interaction, reasons: str = ""):
         if reason.strip()
     )
     saved = upsert_pro_settings(interaction.guild_id, interaction.user.id, rejection_reasons=cleaned)
-    await interaction.response.send_message(
+    await interaction.followup.send(
         "Saved rejection reasons updated." if saved else "I could not save rejection reasons.",
         ephemeral=True,
     )
@@ -4317,12 +4633,12 @@ async def reasons(interaction: discord.Interaction, reasons: str = ""):
 @app_commands.describe(channel="Optional channel to save as the weekly digest target")
 async def digest(interaction: discord.Interaction, channel: discord.TextChannel = None):
     logger.info("Received /digest from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    await interaction.response.defer(ephemeral=True)
     error = require_pro_admin(interaction)
     if error:
-        await interaction.response.send_message(error, ephemeral=True)
+        await interaction.followup.send(error, ephemeral=True)
         return
 
-    await interaction.response.defer(ephemeral=True)
     if channel:
         upsert_pro_settings(interaction.guild_id, interaction.user.id, digest_channel_id=channel.id)
     settings = get_pro_settings(interaction.guild_id)
@@ -4350,12 +4666,12 @@ async def digest(interaction: discord.Interaction, channel: discord.TextChannel 
 @tree.command(name="analytics", description="Pro admin: view advanced submission analytics")
 async def analytics(interaction: discord.Interaction):
     logger.info("Received /analytics from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    await interaction.response.defer(ephemeral=True)
     error = require_pro_admin(interaction)
     if error:
-        await interaction.response.send_message(error, ephemeral=True)
+        await interaction.followup.send(error, ephemeral=True)
         return
 
-    await interaction.response.defer(ephemeral=True)
     database_url = get_guild_database_url(interaction.guild_id)
     ensure_submission_table(database_url) if database_url else None
     total, approved, rejected, in_queue = fetch_submission_analytics(database_url)
@@ -4375,12 +4691,12 @@ async def analytics(interaction: discord.Interaction):
 @tree.command(name="export", description="Pro admin: export submissions as CSV")
 async def export_submissions(interaction: discord.Interaction):
     logger.info("Received /export_submissions from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    await interaction.response.defer(ephemeral=True)
     error = require_pro_admin(interaction)
     if error:
-        await interaction.response.send_message(error, ephemeral=True)
+        await interaction.followup.send(error, ephemeral=True)
         return
 
-    await interaction.response.defer(ephemeral=True)
     database_url = get_guild_database_url(interaction.guild_id)
     ensure_submission_table(database_url) if database_url else None
     rows = fetch_submissions_for_export(database_url)
@@ -4508,11 +4824,11 @@ async def tickets(interaction: discord.Interaction, status: str = ""):
     if not user_can_manage_submissions(interaction):
         await interaction.response.send_message("You do not have permission to use this.", ephemeral=True)
         return
-    if not guild_has_premium(interaction.guild_id):
-        await interaction.response.send_message("This is a Pro feature.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    if not guild_has_pro(interaction.guild_id):
+        await interaction.followup.send("This is a Pro feature. Starter does not include it.", ephemeral=True)
         return
 
-    await interaction.response.defer(ephemeral=True)
     database_url = get_guild_database_url(interaction.guild_id)
     ensure_submission_table(database_url) if database_url else None
     rows = fetch_support_tickets(database_url, status if status else None)
@@ -4547,11 +4863,11 @@ async def ticket_status(
     if not user_can_manage_submissions(interaction):
         await interaction.response.send_message("You do not have permission to use this.", ephemeral=True)
         return
-    if not guild_has_premium(interaction.guild_id):
-        await interaction.response.send_message("This is a Pro feature.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    if not guild_has_pro(interaction.guild_id):
+        await interaction.followup.send("This is a Pro feature. Starter does not include it.", ephemeral=True)
         return
 
-    await interaction.response.defer(ephemeral=True)
     database_url = get_guild_database_url(interaction.guild_id)
     ensure_submission_table(database_url) if database_url else None
     normalized_ticket_id = normalize_ticket_id(ticket_id)
@@ -4662,10 +4978,11 @@ async def status(
         await interaction.response.send_message("You do not have permission to use this.", ephemeral=True)
         return
 
+    await interaction.response.defer(ephemeral=True)
     database_url = get_guild_database_url(interaction.guild_id)
     updated = update_submission_status(database_url, ticket_id.strip(), new_status.value)
     text = "Status updated." if updated else "Could not update that ticket. Check the ID and database."
-    await interaction.response.send_message(text, ephemeral=True)
+    await interaction.followup.send(text, ephemeral=True)
 
 
 @tree.command(name="panel", description="Admin: browse submissions with filters and pages")
@@ -4901,6 +5218,12 @@ async def on_ready():
     logger.info("LabelUtils Interactive Bot Online: %s", client.user)
     logger.info("Default staff channel ID: %s", DEFAULT_STAFF_CHANNEL_ID)
     logger.info("Targeting sync table: label_submissions")
+    await sync_all_guild_command_visibility()
+
+
+@client.event
+async def on_guild_join(guild: discord.Guild):
+    await sync_command_visibility_for_guild(guild.id)
 
 
 @client.event
@@ -4925,8 +5248,8 @@ def validate_startup_environment() -> bool:
         logger.warning("OWNER_USER_IDS is missing. Owner-only premium commands will reject everyone.")
     if DEFAULT_STAFF_CHANNEL_ID == 0:
         logger.warning("STAFF_CHANNEL_ID is missing. Servers must run /setup_staff.")
-    if DISCORD_GUILD_ID == 0:
-        logger.warning("DISCORD_GUILD_ID is missing. Global slash command updates can take up to 1 hour.")
+    if OWNER_GUILD_ID == 0:
+        logger.warning("OWNER_GUILD_ID is missing. Owner-only commands will not be synced to a private guild.")
     return ok
 
 
