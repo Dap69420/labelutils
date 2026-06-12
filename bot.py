@@ -36,7 +36,7 @@ TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 CONFIG_ENCRYPTION_KEY = os.getenv("CONFIG_ENCRYPTION_KEY")
 PREMIUM_CONTACT = os.getenv("PREMIUM_CONTACT", "Contact the bot owner to buy premium.")
-BOT_INVITE_URL = os.getenv(upda
+BOT_INVITE_URL = os.getenv(
     "BOT_INVITE_URL",
     "https://discord.com/oauth2/authorize?client_id=1513286315201007737"
     "&permissions=4503926112110592&integration_type=0&scope=bot%20applications.commands",
