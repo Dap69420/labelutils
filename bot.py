@@ -86,10 +86,16 @@ try:
 except ValueError:
     OWNER_GUILD_ID = DISCORD_GUILD_ID
 try:
+    WHITE_LABEL_GUILD_ID = int(os.getenv("WHITE_LABEL_GUILD_ID", "0"))
+except ValueError:
+    WHITE_LABEL_GUILD_ID = 0
+try:
     RELEASE_CHANNEL_ID = int(os.getenv("RELEASE_CHANNEL_ID", "0"))
 except ValueError:
     RELEASE_CHANNEL_ID = 0
 RELEASE_REQ_DATABASE_URL = os.getenv("RELEASE_REQ_DATABASE_URL", "")
+WHITE_LABEL_STATUS_TEXT = os.getenv("WHITE_LABEL_STATUS_TEXT", "").strip()
+WHITE_LABEL_STATUS_TYPE = os.getenv("WHITE_LABEL_STATUS_TYPE", "playing").strip().lower()
 
 COOLDOWN_MINUTES = 30
 DB_TIMEOUT_SECONDS = 8
@@ -982,6 +988,24 @@ def ensure_control_tables() -> None:
                     """
                     CREATE INDEX IF NOT EXISTS idx_labelutils_dm_routes_user_id
                     ON labelutils_dm_routes (user_id);
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS vektra_white_label_bots (
+                        guild_id BIGINT PRIMARY KEY,
+                        enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                        client_id TEXT,
+                        bot_token_encrypted TEXT,
+                        status_type TEXT NOT NULL DEFAULT 'playing',
+                        status_text TEXT NOT NULL DEFAULT 'reviewing demos',
+                        manager_status TEXT NOT NULL DEFAULT 'pending',
+                        manager_message TEXT NOT NULL DEFAULT '',
+                        last_started_at TIMESTAMPTZ,
+                        last_seen_at TIMESTAMPTZ,
+                        updated_by BIGINT,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
                     """
                 )
     except Exception:
@@ -3036,6 +3060,20 @@ async def reset_inactive_pro_nickname(interaction: discord.Interaction) -> None:
     await set_bot_server_nickname(interaction, None)
 
 
+def white_label_activity() -> discord.BaseActivity | None:
+    if not WHITE_LABEL_STATUS_TEXT:
+        return None
+
+    status_text = truncate_text(WHITE_LABEL_STATUS_TEXT, 120)
+    if WHITE_LABEL_STATUS_TYPE in {"watching", "watch"}:
+        return discord.Activity(type=discord.ActivityType.watching, name=status_text)
+    if WHITE_LABEL_STATUS_TYPE in {"listening", "listen"}:
+        return discord.Activity(type=discord.ActivityType.listening, name=status_text)
+    if WHITE_LABEL_STATUS_TYPE in {"competing", "compete"}:
+        return discord.Activity(type=discord.ActivityType.competing, name=status_text)
+    return discord.Game(name=status_text)
+
+
 class VektraClient(discord.Client):
     async def setup_hook(self) -> None:
         self.add_view(ProDecisionButtonsView())
@@ -3121,6 +3159,10 @@ async def sync_all_guild_command_visibility() -> None:
     if command_visibility_synced_once:
         return
     command_visibility_synced_once = True
+
+    if WHITE_LABEL_GUILD_ID:
+        await sync_command_visibility_for_guild(WHITE_LABEL_GUILD_ID)
+        return
 
     seen_guild_ids: set[int] = set()
     for guild in client.guilds:
@@ -6133,6 +6175,11 @@ async def recent(interaction: discord.Interaction):
 @client.event
 async def on_ready():
     logger.info("Vektra Interactive Bot Online: %s", client.user)
+    if WHITE_LABEL_GUILD_ID:
+        logger.info("White-label worker locked to guild: %s", WHITE_LABEL_GUILD_ID)
+    activity = white_label_activity()
+    if activity:
+        await client.change_presence(activity=activity)
     logger.info("Default staff channel ID: %s", DEFAULT_STAFF_CHANNEL_ID)
     logger.info("Targeting sync table: label_submissions")
     await sync_all_guild_command_visibility()
@@ -6140,6 +6187,10 @@ async def on_ready():
 
 @client.event
 async def on_guild_join(guild: discord.Guild):
+    if WHITE_LABEL_GUILD_ID and guild.id != WHITE_LABEL_GUILD_ID:
+        logger.warning("White-label worker joined unexpected guild %s; leaving.", guild.id)
+        await guild.leave()
+        return
     await sync_command_visibility_for_guild(guild.id)
 
 

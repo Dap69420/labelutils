@@ -5,8 +5,5 @@ __pycache__/
 .venv/
 venv/
 *.zip
-site-dist/
-package.json
-vercel.json
-scripts/
-docs/
+DocsFolder
+WebDashboard
