@@ -1,3 +1,5 @@
+import asyncio
+import json
 import logging
 import os
 import random
@@ -10,7 +12,9 @@ import csv
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 import discord
 import psycopg
@@ -26,13 +30,13 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-logger = logging.getLogger("labelutils-bot")
+logger = logging.getLogger("vektra-bot")
 
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 CONFIG_ENCRYPTION_KEY = os.getenv("CONFIG_ENCRYPTION_KEY")
 PREMIUM_CONTACT = os.getenv("PREMIUM_CONTACT", "Contact the bot owner to buy premium.")
-BOT_INVITE_URL = os.getenv(
+BOT_INVITE_URL = os.getenv(upda
     "BOT_INVITE_URL",
     "https://discord.com/oauth2/authorize?client_id=1513286315201007737"
     "&permissions=4503926112110592&integration_type=0&scope=bot%20applications.commands",
@@ -81,6 +85,11 @@ try:
     OWNER_GUILD_ID = int(os.getenv("OWNER_GUILD_ID", str(DISCORD_GUILD_ID or 0)))
 except ValueError:
     OWNER_GUILD_ID = DISCORD_GUILD_ID
+try:
+    RELEASE_CHANNEL_ID = int(os.getenv("RELEASE_CHANNEL_ID", "0"))
+except ValueError:
+    RELEASE_CHANNEL_ID = 0
+RELEASE_REQ_DATABASE_URL = os.getenv("RELEASE_REQ_DATABASE_URL", "")
 
 COOLDOWN_MINUTES = 30
 DB_TIMEOUT_SECONDS = 8
@@ -90,6 +99,9 @@ try:
     HEALTH_PORT = int(os.getenv("PORT", os.getenv("HEALTH_PORT", "7860")))
 except ValueError:
     HEALTH_PORT = 7860
+SAMBANOVA_API_KEY = os.getenv("SAMBANOVA_API_KEY", "")
+SAMBANOVA_API_URL = os.getenv("SAMBANOVA_API_URL", "https://api.sambanova.ai/v1/chat/completions")
+SAMBANOVA_MODEL = os.getenv("SAMBANOVA_MODEL", "Meta-Llama-3.1-8B-Instruct")
 PANEL_PAGE_SIZE = 4
 LEADERBOARD_PAGE_SIZE = 10
 class StorageContext:
@@ -110,6 +122,7 @@ class StorageContext:
 
 
 submission_cooldowns: dict[int, datetime] = {}
+release_cooldowns: dict[int, datetime] = {}
 guild_database_cache: dict[int, StorageContext | None] = {}
 guild_staff_channel_cache: dict[int, int] = {}
 guild_brand_cache: dict[int, dict[str, object] | None] = {}
@@ -299,6 +312,19 @@ def set_submission_cooldown(user_id: int, minutes: int = COOLDOWN_MINUTES) -> No
     submission_cooldowns[user_id] = datetime.now(timezone.utc) + timedelta(minutes=minutes)
 
 
+def get_release_cooldown_remaining(user_id: int) -> timedelta | None:
+    now = datetime.now(timezone.utc)
+    expires_at = release_cooldowns.get(user_id)
+    if not expires_at or expires_at <= now:
+        release_cooldowns.pop(user_id, None)
+        return None
+    return expires_at - now
+
+
+def set_release_cooldown(user_id: int, minutes: int = 5) -> None:
+    release_cooldowns[user_id] = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+
+
 def is_valid_database_url(value: str) -> bool:
     parsed = urlparse(value.strip())
     return parsed.scheme in {"postgres", "postgresql"} and bool(parsed.netloc)
@@ -318,6 +344,457 @@ def normalize_ticket_id(value: str) -> str:
 def normalize_coupon_code(value: str) -> str:
     cleaned = value.strip().strip("`").upper()
     return "".join(ch for ch in cleaned if ch.isalnum() or ch == "-")
+
+
+RELEASE_AI_REQUIRED_FIELDS = {
+    "label_name": "Label Name",
+    "album_title": "Album Title",
+    "artists": "Artists",
+    "label_owner_legal_name": "Label Owner Legal Name",
+    "contact_emails": "Artist/Owner Emails",
+}
+RELEASE_AI_OPTIONAL_FIELDS = {
+    "upc": "UPC Code",
+    "number_of_tracks": "Number of Tracks",
+    "version_titles": "Version Titles/Names",
+    "track_titles": "Track Titles",
+    "release_date": "Release Date",
+    "genre": "Genre",
+    "explicit_content": "Explicit Content",
+    "isrcs": "ISRCs",
+}
+RELEASE_MANUAL_FIELDS = {
+    "c_line": "C Line",
+    "p_line": "P Line",
+    "composers_producers_legal_names": "Composers/Producers",
+    "download_link": "Drive/Download Link",
+}
+RELEASE_METADATA_FIELDS = {
+    **RELEASE_AI_REQUIRED_FIELDS,
+    **RELEASE_AI_OPTIONAL_FIELDS,
+    **RELEASE_MANUAL_FIELDS,
+}
+
+
+def generate_release_id() -> str:
+    part = "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
+    return f"REL-{part}"
+
+
+def extract_json_object(value: str) -> dict[str, object] | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        pass
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    try:
+        parsed = json.loads(text[start : end + 1])
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+
+def normalize_release_metadata(value: object) -> dict[str, str]:
+    source = value if isinstance(value, dict) else {}
+    metadata: dict[str, str] = {}
+    for key in RELEASE_METADATA_FIELDS:
+        item = source.get(key, "")
+        if isinstance(item, list):
+            item = ", ".join(str(part).strip() for part in item if str(part).strip())
+        metadata[key] = str(item or "").strip()
+    for key in RELEASE_AI_OPTIONAL_FIELDS:
+        if not metadata.get(key) or metadata[key].lower() in {"unknown", "none", "n/a", "not provided"}:
+            metadata[key] = "Auto"
+    return metadata
+
+
+def normalize_release_analysis(raw: object) -> dict[str, object]:
+    data = raw if isinstance(raw, dict) else {}
+    metadata = normalize_release_metadata(data.get("metadata") if isinstance(data.get("metadata"), dict) else data)
+    missing = [
+        key
+        for key in RELEASE_AI_REQUIRED_FIELDS
+        if not metadata.get(key) or metadata.get(key, "").lower() in {"unknown", "none", "n/a", "not provided"}
+    ]
+    model_missing = data.get("missing")
+    if isinstance(model_missing, list):
+        for item in model_missing:
+            normalized = str(item or "").strip().lower().replace(" ", "_").replace("/", "_")
+            aliases = {
+                "label": "label_name",
+                "label_name": "label_name",
+                "album": "album_title",
+                "album_title": "album_title",
+                "title": "album_title",
+                "artist": "artists",
+                "artists": "artists",
+                "label_owner": "label_owner_legal_name",
+                "label_owner_legal_name": "label_owner_legal_name",
+                "owner_legal_name": "label_owner_legal_name",
+                "legal_name_of_label_owner": "label_owner_legal_name",
+                "email": "contact_emails",
+                "emails": "contact_emails",
+                "contact_email": "contact_emails",
+                "contact_emails": "contact_emails",
+                "artist_emails": "contact_emails",
+                "owner_email": "contact_emails",
+            }
+            key = aliases.get(normalized)
+            if key and key not in missing:
+                missing.append(key)
+
+    accepted = bool(data.get("accepted")) and not missing
+    reason = str(data.get("reason") or "").strip()
+    if not reason:
+        reason = "Required release metadata was found." if accepted else "Required release metadata is missing or unclear."
+    return {
+        "accepted": accepted,
+        "missing": missing,
+        "reason": reason,
+        "metadata": metadata,
+    }
+
+
+def call_sambanova_release_analyzer(release_details: str, download_link: str) -> dict[str, object]:
+    if not SAMBANOVA_API_KEY:
+        return {
+            "accepted": False,
+            "missing": list(RELEASE_AI_REQUIRED_FIELDS),
+            "reason": "Release metadata checker is not configured. Add SAMBANOVA_API_KEY on the host.",
+            "metadata": {},
+        }
+
+    system_prompt = (
+        "You extract release metadata for a digital music distributor intake. "
+        "Return only valid JSON. Do not include markdown. "
+        "Only these fields are required: label_name, album_title, artists, label_owner_legal_name, contact_emails. "
+        "Reject only if one of those required fields is missing, vague, placeholder text, or not clearly provided. "
+        "The contact_emails field must clearly map each email address to a person or role, including the label owner and every listed artist. "
+        "Reject if emails are present but it is unclear which email belongs to whom. "
+        "Extract optional metadata when present: UPC code, number of tracks, version titles/names, track titles, release date, genre, explicit content, and ISRCs. "
+        "If optional metadata is not present, leave it blank and do not reject."
+    )
+    user_prompt = (
+        "Analyze this release request and output JSON with this exact shape:\n"
+        "{"
+        "\"accepted\": boolean, "
+        "\"missing\": [\"field_key\"], "
+        "\"reason\": \"short explanation\", "
+        "\"metadata\": {"
+        "\"label_name\": \"\", "
+        "\"album_title\": \"\", "
+        "\"artists\": \"\", "
+        "\"label_owner_legal_name\": \"\", "
+        "\"contact_emails\": \"\", "
+        "\"upc\": \"\", "
+        "\"number_of_tracks\": \"\", "
+        "\"version_titles\": \"\", "
+        "\"track_titles\": \"\", "
+        "\"release_date\": \"\", "
+        "\"genre\": \"\", "
+        "\"explicit_content\": \"\", "
+        "\"isrcs\": \"\""
+        "}"
+        "}\n\n"
+        f"Release details:\n{release_details.strip()}"
+    )
+    payload = {
+        "model": SAMBANOVA_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0,
+    }
+    request = Request(
+        SAMBANOVA_API_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {SAMBANOVA_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=35) as response:
+            body = response.read().decode("utf-8", errors="replace")
+    except HTTPError as error:
+        body = error.read().decode("utf-8", errors="replace")
+        logger.warning("SambaNova release metadata check failed with HTTP %s: %s", error.code, truncate_text(body, 500))
+        return {
+            "accepted": False,
+            "missing": list(RELEASE_AI_REQUIRED_FIELDS),
+            "reason": "Release metadata checker returned an API error. Please try again later.",
+            "metadata": {},
+        }
+    except (TimeoutError, URLError, OSError) as error:
+        logger.warning("SambaNova release metadata check failed: %s", error)
+        return {
+            "accepted": False,
+            "missing": list(RELEASE_AI_REQUIRED_FIELDS),
+            "reason": "Release metadata checker is unavailable right now. Please try again later.",
+            "metadata": {},
+        }
+
+    try:
+        api_data = json.loads(body)
+        content = api_data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError):
+        logger.warning("Unexpected SambaNova release metadata response: %s", truncate_text(body, 500))
+        content = body
+
+    parsed = extract_json_object(str(content))
+    if not parsed:
+        logger.warning("Could not parse SambaNova release metadata JSON: %s", truncate_text(content, 500))
+        return {
+            "accepted": False,
+            "missing": list(RELEASE_AI_REQUIRED_FIELDS),
+            "reason": "Release metadata checker could not parse the metadata clearly.",
+            "metadata": {},
+        }
+    return normalize_release_analysis(parsed)
+
+
+async def analyze_release_metadata(release_details: str, download_link: str) -> dict[str, object]:
+    return await asyncio.to_thread(call_sambanova_release_analyzer, release_details, download_link)
+
+
+def ensure_release_request_table() -> bool:
+    if not RELEASE_REQ_DATABASE_URL:
+        return False
+
+    try:
+        with connect_db(RELEASE_REQ_DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS vektra_release_requests (
+                        release_id TEXT PRIMARY KEY,
+                        submitter_user_id BIGINT NOT NULL,
+                        submitter_username TEXT NOT NULL,
+                        source_guild_id BIGINT,
+                        source_guild_name TEXT,
+                        status TEXT NOT NULL DEFAULT 'Pending QC',
+                        metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        original_request TEXT NOT NULL,
+                        c_line TEXT NOT NULL,
+                        p_line TEXT NOT NULL,
+                        composers_producers TEXT NOT NULL,
+                        download_link TEXT NOT NULL,
+                        ai_reason TEXT,
+                        staff_channel_id BIGINT,
+                        staff_message_id BIGINT,
+                        thread_id BIGINT,
+                        reject_reason TEXT,
+                        rejected_by BIGINT,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                    """
+                )
+                cur.execute("ALTER TABLE vektra_release_requests ADD COLUMN IF NOT EXISTS decision_reason TEXT;")
+                cur.execute("ALTER TABLE vektra_release_requests ADD COLUMN IF NOT EXISTS reviewed_by BIGINT;")
+        return True
+    except Exception:
+        logger.exception("Failed to ensure release request table.")
+        return False
+
+
+def save_release_request_record(
+    *,
+    release_id: str,
+    submitter_user_id: int,
+    submitter_username: str,
+    source_guild_id: int | None,
+    source_guild_name: str,
+    metadata: dict[str, str],
+    original_request: str,
+    c_line: str,
+    p_line: str,
+    composers_producers: str,
+    download_link: str,
+    ai_reason: str,
+) -> bool:
+    if not ensure_release_request_table():
+        return False
+
+    try:
+        with connect_db(RELEASE_REQ_DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO vektra_release_requests (
+                        release_id, submitter_user_id, submitter_username,
+                        source_guild_id, source_guild_name, status, metadata_json,
+                        original_request, c_line, p_line, composers_producers,
+                        download_link, ai_reason, created_at, updated_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, 'Pending QC', %s::jsonb,
+                        %s, %s, %s, %s, %s, %s, NOW(), NOW()
+                    )
+                    ON CONFLICT (release_id)
+                    DO UPDATE SET
+                        submitter_user_id = EXCLUDED.submitter_user_id,
+                        submitter_username = EXCLUDED.submitter_username,
+                        source_guild_id = EXCLUDED.source_guild_id,
+                        source_guild_name = EXCLUDED.source_guild_name,
+                        status = EXCLUDED.status,
+                        metadata_json = EXCLUDED.metadata_json,
+                        original_request = EXCLUDED.original_request,
+                        c_line = EXCLUDED.c_line,
+                        p_line = EXCLUDED.p_line,
+                        composers_producers = EXCLUDED.composers_producers,
+                        download_link = EXCLUDED.download_link,
+                        ai_reason = EXCLUDED.ai_reason,
+                        updated_at = NOW();
+                    """,
+                    (
+                        release_id,
+                        submitter_user_id,
+                        submitter_username,
+                        source_guild_id,
+                        source_guild_name,
+                        json.dumps(metadata),
+                        original_request,
+                        c_line,
+                        p_line,
+                        composers_producers,
+                        download_link,
+                        ai_reason,
+                    ),
+                )
+        return True
+    except Exception:
+        logger.exception("Failed to save release request %s.", release_id)
+        return False
+
+
+def update_release_request_discord_refs(
+    release_id: str,
+    *,
+    staff_channel_id: int | None = None,
+    staff_message_id: int | None = None,
+    thread_id: int | None = None,
+) -> bool:
+    if not RELEASE_REQ_DATABASE_URL:
+        return False
+    updates: list[str] = []
+    params: list[object] = []
+    if staff_channel_id is not None:
+        updates.append("staff_channel_id = %s")
+        params.append(staff_channel_id)
+    if staff_message_id is not None:
+        updates.append("staff_message_id = %s")
+        params.append(staff_message_id)
+    if thread_id is not None:
+        updates.append("thread_id = %s")
+        params.append(thread_id)
+    if not updates:
+        return True
+    params.append(release_id)
+
+    try:
+        with connect_db(RELEASE_REQ_DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE vektra_release_requests
+                    SET {", ".join(updates)}, updated_at = NOW()
+                    WHERE release_id = %s;
+                    """,
+                    tuple(params),
+                )
+        return True
+    except Exception:
+        logger.exception("Failed to update release request Discord refs for %s.", release_id)
+        return False
+
+
+def mark_release_request_rejected(release_id: str, reason: str, rejected_by: int) -> bool:
+    if not RELEASE_REQ_DATABASE_URL:
+        return False
+    try:
+        with connect_db(RELEASE_REQ_DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE vektra_release_requests
+                    SET status = 'Rejected',
+                        reject_reason = %s,
+                        decision_reason = %s,
+                        rejected_by = %s,
+                        reviewed_by = %s,
+                        updated_at = NOW()
+                    WHERE release_id = %s;
+                    """,
+                    (reason, reason, rejected_by, rejected_by, release_id),
+                )
+        return True
+    except Exception:
+        logger.exception("Failed to mark release request %s rejected.", release_id)
+        return False
+
+
+def mark_release_request_accepted(release_id: str, reason: str, reviewed_by: int) -> bool:
+    if not RELEASE_REQ_DATABASE_URL:
+        return False
+    try:
+        with connect_db(RELEASE_REQ_DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE vektra_release_requests
+                    SET status = 'Accepted',
+                        decision_reason = %s,
+                        reviewed_by = %s,
+                        updated_at = NOW()
+                    WHERE release_id = %s;
+                    """,
+                    (reason, reviewed_by, release_id),
+                )
+        return True
+    except Exception:
+        logger.exception("Failed to mark release request %s accepted.", release_id)
+        return False
+
+
+def fetch_release_requests_for_guild(guild_id: int, limit: int = 10) -> list[tuple]:
+    if not RELEASE_REQ_DATABASE_URL:
+        return []
+    if not ensure_release_request_table():
+        return []
+    try:
+        with connect_db(RELEASE_REQ_DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        release_id,
+                        status,
+                        metadata_json,
+                        reject_reason,
+                        decision_reason,
+                        created_at,
+                        updated_at
+                    FROM vektra_release_requests
+                    WHERE source_guild_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s;
+                    """,
+                    (guild_id, limit),
+                )
+                return cur.fetchall()
+    except Exception:
+        logger.exception("Failed to fetch release requests for guild %s.", guild_id)
+        return []
 
 
 def guild_schema_name(guild_id: int) -> str:
@@ -508,7 +985,7 @@ def ensure_control_tables() -> None:
                     """
                 )
     except Exception:
-        logger.exception("Failed to ensure LabelUtils control tables.")
+        logger.exception("Failed to ensure Vektra control tables.")
 
 
 def ensure_submission_table(database_url: str | StorageContext) -> bool:
@@ -1021,7 +1498,7 @@ def generate_coupon_code() -> str:
         "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
         for _ in range(3)
     ]
-    return f"LU-{'-'.join(parts)}"
+    return f"VK-{'-'.join(parts)}"
 
 
 def create_premium_coupon(
@@ -2255,6 +2732,14 @@ def support_ticket_info_from_message(message: discord.Message) -> tuple[str, int
     return ticket_id, user_id, subject
 
 
+def release_request_info_from_message(message: discord.Message) -> tuple[str, int, str]:
+    embed = message.embeds[0]
+    release_id = embed_field(embed, "Release ID")
+    user_id = int(embed_field(embed, "Submitter User ID", "0"))
+    album_title = embed_field(embed, "Album Title", "this release")
+    return release_id, user_id, album_title
+
+
 def submission_thread_id_from_message(message: discord.Message) -> int | None:
     if not message.embeds:
         return None
@@ -2284,6 +2769,16 @@ async def log_submission_thread(
         await thread.send(content=content, embed=embed)
     except Exception:
         logger.exception("Failed to log to submission thread %s.", thread_id)
+
+
+async def log_release_thread(message: discord.Message, content: str) -> None:
+    thread = getattr(message, "thread", None)
+    if not thread:
+        return
+    try:
+        await thread.send(content)
+    except Exception:
+        logger.exception("Failed to log to release request thread for message %s.", message.id)
 
 
 def format_dm_reply_attachments(attachments: list[discord.Attachment]) -> str:
@@ -2506,7 +3001,7 @@ async def set_bot_server_nickname(
         nickname = truncate_text(display_name, 32) if display_name else None
         await interaction.guild.me.edit(
             nick=nickname,
-            reason=f"LabelUtils branding updated by {interaction.user}",
+            reason=f"Vektra branding updated by {interaction.user}",
         )
         return (
             f"Bot nickname changed to `{nickname}`."
@@ -2541,12 +3036,13 @@ async def reset_inactive_pro_nickname(interaction: discord.Interaction) -> None:
     await set_bot_server_nickname(interaction, None)
 
 
-class LabelUtilsClient(discord.Client):
+class VektraClient(discord.Client):
     async def setup_hook(self) -> None:
         self.add_view(ProDecisionButtonsView())
         self.add_view(SubmitPanelView())
         self.add_view(SupportTicketPanelView())
         self.add_view(SupportTicketButtonsView())
+        self.add_view(ReleaseRequestReviewView())
         prepare_tiered_command_registry()
         command_names = ", ".join(command.name for command in tree.get_commands())
         logger.info("Registering global slash command(s): %s", command_names)
@@ -2558,7 +3054,7 @@ class LabelUtilsClient(discord.Client):
             logger.warning("OWNER_GUILD_ID is missing. Owner-only commands will not be visible in any guild.")
 
 
-client = LabelUtilsClient(intents=intents)
+client = VektraClient(intents=intents)
 tree = app_commands.CommandTree(client)
 
 
@@ -2996,6 +3492,126 @@ class SupportTicketButtonsView(discord.ui.View):
         await interaction.response.send_modal(SupportTicketDmModal(interaction.message))
 
 
+class ReleaseRejectReasonModal(discord.ui.Modal, title="Reject Release"):
+    reason = discord.ui.TextInput(
+        label="Rejection Reason",
+        placeholder="Tell the submitter what needs to be fixed.",
+        style=discord.TextStyle.paragraph,
+        max_length=1000,
+        required=True,
+    )
+
+    def __init__(self, staff_message: discord.Message):
+        super().__init__()
+        self.staff_message = staff_message
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        release_id, submitter_id, album_title = release_request_info_from_message(self.staff_message)
+        reason_text = self.reason.value.strip()
+        db_updated = mark_release_request_rejected(release_id, reason_text, interaction.user.id)
+
+        dm_content = (
+            f"Your Vektra release request **{album_title}** (`{release_id}`) was rejected during QC.\n\n"
+            f"Reason: {reason_text}\n\n"
+            "You can submit again with corrected metadata/files using `/make-release`."
+        )
+        dm_sent = bool(await dm_artist_text(submitter_id, dm_content))
+
+        old_embed = self.staff_message.embeds[0]
+        old_embed.color = 0xF04747
+        set_embed_field(old_embed, "Status", "Rejected", inline=True)
+        set_embed_field(old_embed, "Rejection Reason", reason_text, inline=False)
+        old_embed.set_footer(
+            text=(
+                f"Rejected by @{interaction.user.name} | "
+                f"{'Submitter DM sent' if dm_sent else 'Submitter DM failed'} | "
+                f"{'DB updated' if db_updated else 'DB update failed'}"
+            )
+        )
+        await self.staff_message.edit(embed=old_embed, view=ReleaseRequestReviewView(final_decision=True))
+        await log_release_thread(
+            self.staff_message,
+            (
+                f"Release request rejected by {interaction.user.mention}.\n"
+                f"Reason: {reason_text}\n"
+                f"Submitter DM: {'sent' if dm_sent else 'failed'} | DB: {'updated' if db_updated else 'failed'}"
+            ),
+        )
+        await interaction.followup.send("Release request rejected and submitter notified.", ephemeral=True)
+
+
+class ReleaseAcceptNoteModal(discord.ui.Modal, title="Accept Release"):
+    note = discord.ui.TextInput(
+        label="Acceptance Note",
+        placeholder="Optional note for the submitter.",
+        style=discord.TextStyle.paragraph,
+        max_length=800,
+        required=False,
+    )
+
+    def __init__(self, staff_message: discord.Message):
+        super().__init__()
+        self.staff_message = staff_message
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        release_id, submitter_id, album_title = release_request_info_from_message(self.staff_message)
+        note_text = self.note.value.strip() or "Passed Vektra QC. The release can move forward for Labelcaster delivery."
+        db_updated = mark_release_request_accepted(release_id, note_text, interaction.user.id)
+
+        dm_content = (
+            f"Your Vektra release request **{album_title}** (`{release_id}`) was accepted during QC.\n\n"
+            f"Note: {note_text}"
+        )
+        dm_sent = bool(await dm_artist_text(submitter_id, dm_content))
+
+        old_embed = self.staff_message.embeds[0]
+        old_embed.color = 0x43B581
+        set_embed_field(old_embed, "Status", "Accepted", inline=True)
+        set_embed_field(old_embed, "Decision Note", note_text, inline=False)
+        old_embed.set_footer(
+            text=(
+                f"Accepted by @{interaction.user.name} | "
+                f"{'Submitter DM sent' if dm_sent else 'Submitter DM failed'} | "
+                f"{'DB updated' if db_updated else 'DB update failed'}"
+            )
+        )
+        await self.staff_message.edit(embed=old_embed, view=ReleaseRequestReviewView(final_decision=True))
+        await log_release_thread(
+            self.staff_message,
+            (
+                f"Release request accepted by {interaction.user.mention}.\n"
+                f"Note: {note_text}\n"
+                f"Submitter DM: {'sent' if dm_sent else 'failed'} | DB: {'updated' if db_updated else 'failed'}"
+            ),
+        )
+        await interaction.followup.send("Release request accepted and submitter notified.", ephemeral=True)
+
+
+class ReleaseRequestReviewView(discord.ui.View):
+    def __init__(self, *, final_decision: bool = False):
+        super().__init__(timeout=None)
+        if final_decision:
+            for item in self.children:
+                if getattr(item, "custom_id", "") in {"release_request:accept", "release_request:reject"}:
+                    item.disabled = True
+
+    @discord.ui.button(label="Accept", style=discord.ButtonStyle.green, custom_id="release_request:accept")
+    async def accept_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not user_can_manage_submissions(interaction):
+            await interaction.response.send_message("You do not have permission to accept release requests.", ephemeral=True)
+            return
+        await interaction.response.send_modal(ReleaseAcceptNoteModal(interaction.message))
+
+    @discord.ui.button(label="Reject", style=discord.ButtonStyle.red, custom_id="release_request:reject")
+    async def reject_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not user_can_manage_submissions(interaction):
+            await interaction.response.send_message("You do not have permission to reject release requests.", ephemeral=True)
+            return
+        await interaction.response.send_modal(ReleaseRejectReasonModal(interaction.message))
+
+
 def panel_embed(
     status_filter: str | None,
     sort_order: str,
@@ -3330,7 +3946,7 @@ class DatabaseSetupModal(discord.ui.Modal, title="Set Server Database"):
         saved = set_guild_database_url(interaction.guild_id, interaction.user.id, value)
         if saved:
             await interaction.followup.send(
-                "Custom database connected. Existing LabelUtils data was migrated before switching.",
+                "Custom database connected. Existing Vektra data was migrated before switching.",
                 ephemeral=True,
             )
         else:
@@ -3521,19 +4137,294 @@ class AdvancedSubmissionModal(discord.ui.Modal, title="New Label Submission"):
             )
 
 
+async def get_release_qc_channel() -> tuple[object | None, str | None]:
+    if OWNER_GUILD_ID == 0:
+        return None, "OWNER_GUILD_ID is not configured on the bot host."
+    if RELEASE_CHANNEL_ID == 0:
+        return None, "RELEASE_CHANNEL_ID is not configured on the bot host."
+
+    channel = client.get_channel(RELEASE_CHANNEL_ID)
+    if not channel:
+        try:
+            channel = await client.fetch_channel(RELEASE_CHANNEL_ID)
+        except discord.Forbidden:
+            return None, "I cannot access the configured release channel. Check bot permissions."
+        except discord.NotFound:
+            return None, "The configured release channel was not found."
+        except Exception:
+            logger.exception("Failed to fetch release channel %s.", RELEASE_CHANNEL_ID)
+            return None, "I could not reach the configured release channel."
+
+    channel_guild = getattr(channel, "guild", None)
+    if channel_guild and channel_guild.id != OWNER_GUILD_ID:
+        return None, "RELEASE_CHANNEL_ID must belong to the OWNER_GUILD_ID server."
+    if not hasattr(channel, "send"):
+        return None, "The configured release channel cannot receive messages."
+    return channel, None
+
+
+class ReleaseRequestModal(discord.ui.Modal, title="Make Release"):
+    release_details = discord.ui.TextInput(
+        label="Release Metadata",
+        placeholder=(
+            "Include label, title, artists, owner legal name, and named emails."
+        ),
+        style=discord.TextStyle.paragraph,
+        max_length=3500,
+        required=True,
+    )
+    c_line = discord.ui.TextInput(
+        label="C Line",
+        placeholder="e.g., (C) 2026 Label Name",
+        max_length=300,
+        required=True,
+    )
+    p_line = discord.ui.TextInput(
+        label="P Line",
+        placeholder="e.g., (P) 2026 Label Name",
+        max_length=300,
+        required=True,
+    )
+    composers_producers = discord.ui.TextInput(
+        label="Composers/Producers",
+        placeholder="Legal names, not only stage names",
+        style=discord.TextStyle.paragraph,
+        max_length=800,
+        required=True,
+    )
+    download_link = discord.ui.TextInput(
+        label="Drive or Download Link",
+        placeholder="https://drive.google.com/... or another downloadable link",
+        max_length=500,
+        required=True,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        if not interaction.guild_id or not user_is_admin(interaction):
+            await interaction.followup.send("Only server administrators can submit release requests.", ephemeral=True)
+            return
+
+        link = self.download_link.value.strip()
+        details = self.release_details.value.strip()
+        c_line = self.c_line.value.strip()
+        p_line = self.p_line.value.strip()
+        composers_producers = self.composers_producers.value.strip()
+        if not is_valid_url(link):
+            await interaction.followup.send(
+                "Please provide a valid Drive/download link starting with `http://` or `https://`.",
+                ephemeral=True,
+            )
+            return
+
+        remaining = get_release_cooldown_remaining(interaction.user.id)
+        if remaining:
+            minutes = max(1, int(remaining.total_seconds() // 60))
+            await interaction.followup.send(
+                f"Please wait about {minutes} minute(s) before submitting another release request.",
+                ephemeral=True,
+            )
+            return
+
+        release_channel, channel_error = await get_release_qc_channel()
+        if channel_error:
+            await interaction.followup.send(channel_error, ephemeral=True)
+            return
+        if not RELEASE_REQ_DATABASE_URL:
+            await interaction.followup.send(
+                "RELEASE_REQ_DATABASE_URL is not configured on the bot host.",
+                ephemeral=True,
+            )
+            return
+        if not ensure_release_request_table():
+            await interaction.followup.send(
+                "I could not connect to the release request database.",
+                ephemeral=True,
+            )
+            return
+
+        set_release_cooldown(interaction.user.id)
+        analysis = await analyze_release_metadata(details, link)
+        if not analysis.get("accepted"):
+            missing = analysis.get("missing") if isinstance(analysis.get("missing"), list) else []
+            missing_labels = [
+                RELEASE_AI_REQUIRED_FIELDS.get(str(key), str(key))
+                for key in missing
+            ]
+            missing_text = ", ".join(missing_labels) if missing_labels else "Required release metadata"
+            await interaction.followup.send(
+                (
+                    "Release request rejected by metadata check.\n"
+                    f"Missing/unclear: **{truncate_text(missing_text, 700)}**\n"
+                    f"Reason: {truncate_text(analysis.get('reason'), 900)}\n\n"
+                    "Submit again with clear label name, album title, artists, label owner legal name, "
+                    "and emails showing which email belongs to each artist and the label owner."
+                ),
+                ephemeral=True,
+            )
+            return
+
+        metadata = normalize_release_metadata(analysis.get("metadata"))
+        metadata.update(
+            {
+                "c_line": c_line,
+                "p_line": p_line,
+                "composers_producers_legal_names": composers_producers,
+                "download_link": link,
+            }
+        )
+        release_id = generate_release_id()
+        source_server = interaction.guild.name if interaction.guild else "DM or unknown server"
+        source_guild_id = interaction.guild.id if interaction.guild else None
+        submitter = f"{interaction.user.mention} (`{interaction.user.id}`)"
+        ai_reason = str(analysis.get("reason") or "")
+        saved = save_release_request_record(
+            release_id=release_id,
+            submitter_user_id=interaction.user.id,
+            submitter_username=str(interaction.user),
+            source_guild_id=source_guild_id,
+            source_guild_name=source_server,
+            metadata=metadata,
+            original_request=details,
+            c_line=c_line,
+            p_line=p_line,
+            composers_producers=composers_producers,
+            download_link=link,
+            ai_reason=ai_reason,
+        )
+        if not saved:
+            await interaction.followup.send(
+                "The release metadata passed, but I could not save it to the release request database.",
+                ephemeral=True,
+            )
+            return
+
+        embed = discord.Embed(
+            title="New Release Request",
+            description="Passed AI metadata check. Ready for Vektra QC before Labelcaster delivery.",
+            color=0x16A34A,
+        )
+        embed.add_field(name="Release ID", value=release_id, inline=False)
+        embed.add_field(name="Status", value="Pending QC", inline=True)
+        embed.add_field(name="Submitter", value=submitter, inline=False)
+        embed.add_field(name="Submitter User ID", value=str(interaction.user.id), inline=False)
+        embed.add_field(name="Source Server", value=truncate_text(source_server, 120), inline=False)
+        for key, label in RELEASE_AI_REQUIRED_FIELDS.items():
+            embed.add_field(name=label, value=truncate_text(metadata.get(key), 1000), inline=False)
+        for key, label in RELEASE_MANUAL_FIELDS.items():
+            embed.add_field(name=label, value=truncate_text(metadata.get(key), 1000), inline=False)
+        for key, label in RELEASE_AI_OPTIONAL_FIELDS.items():
+            embed.add_field(name=label, value=truncate_text(metadata.get(key), 1000), inline=False)
+        embed.add_field(name="AI QC Reason", value=truncate_text(ai_reason, 1000), inline=False)
+        embed.add_field(name="Original Request", value=truncate_text(details, 1000), inline=False)
+        embed.set_footer(text="Review audio files, cover art, metadata, and rights before sending to Labelcaster.")
+
+        try:
+            staff_message = await release_channel.send(embed=embed, view=ReleaseRequestReviewView())
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "I passed the metadata check, but I cannot post in the configured release channel. Check bot permissions.",
+                ephemeral=True,
+            )
+            return
+        except Exception:
+            logger.exception("Failed to post release request %s to release channel.", release_id)
+            await interaction.followup.send(
+                "I passed the metadata check, but posting to the release QC channel failed.",
+                ephemeral=True,
+            )
+            return
+
+        update_release_request_discord_refs(
+            release_id,
+            staff_channel_id=release_channel.id,
+            staff_message_id=staff_message.id,
+        )
+        thread = await create_release_request_thread(
+            staff_message,
+            release_id,
+            metadata.get("album_title") or "release",
+            interaction.user.id,
+        )
+        if thread:
+            update_release_request_discord_refs(release_id, thread_id=thread.id)
+
+        await interaction.followup.send(
+            (
+                f"Release request accepted for Vektra QC: `{release_id}`.\n"
+                "Our team will review the files and metadata before sending it to Labelcaster."
+            ),
+            ephemeral=True,
+        )
+
+
+@tree.command(name="make-release", description="Admin: submit a release request for Vektra QC and Labelcaster delivery")
+@app_commands.default_permissions(administrator=True)
+async def make_release(interaction: discord.Interaction):
+    if not interaction.guild_id:
+        await interaction.response.send_message("Release requests must be submitted from a server.", ephemeral=True)
+        return
+    if not user_is_admin(interaction):
+        await interaction.response.send_message("Only server administrators can submit release requests.", ephemeral=True)
+        return
+    await interaction.response.send_modal(ReleaseRequestModal())
+
+
+@tree.command(name="check-releases", description="Admin: view release requests submitted by this server")
+@app_commands.default_permissions(administrator=True)
+async def check_releases(interaction: discord.Interaction):
+    if not interaction.guild_id:
+        await interaction.response.send_message("This command must be used inside a server.", ephemeral=True)
+        return
+    if not user_is_admin(interaction):
+        await interaction.response.send_message("Only server administrators can check release requests.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    if not RELEASE_REQ_DATABASE_URL:
+        await interaction.followup.send("RELEASE_REQ_DATABASE_URL is not configured on the bot host.", ephemeral=True)
+        return
+
+    rows = fetch_release_requests_for_guild(interaction.guild_id, limit=10)
+    embed = discord.Embed(
+        title="Release Requests",
+        description="Newest release requests submitted by this server.",
+        color=server_embed_color(interaction, 0x16A34A),
+    )
+    if not rows:
+        embed.description = "No release requests were found for this server yet."
+    for release_id, status, metadata_json, reject_reason, decision_reason, created_at, updated_at in rows:
+        metadata = metadata_json if isinstance(metadata_json, dict) else {}
+        title = metadata.get("album_title") or "Untitled release"
+        artists = metadata.get("artists") or "Unknown artist"
+        reason = decision_reason or reject_reason or "No decision reason yet."
+        embed.add_field(
+            name=f"{release_id} | {status}",
+            value=(
+                f"Title: **{truncate_text(title, 120)}**\n"
+                f"Artists: {truncate_text(artists, 160)}\n"
+                f"Reason: {truncate_text(reason, 300)}\n"
+                f"Submitted: {discord_timestamp(created_at, 'R')} | Updated: {discord_timestamp(updated_at, 'R')}"
+            ),
+            inline=False,
+        )
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
 @tree.command(name="submit", description="Submit your demo tracking profile to the label")
 async def submit(interaction: discord.Interaction):
     await interaction.response.send_modal(AdvancedSubmissionModal(interaction.guild_id))
 
 
-@tree.command(name="help", description="Show LabelUtils commands and setup steps")
+@tree.command(name="help", description="Show Vektra commands and setup steps")
 async def help_command(interaction: discord.Interaction):
     logger.info("Received /help from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
     await interaction.response.defer(ephemeral=True)
     premium_row = get_premium_guild(interaction.guild_id)
     premium_name = premium_plan_label(premium_row[0]) if premium_row else "not active"
     embed = discord.Embed(
-        title="LabelUtils Help",
+        title="Vektra Help",
         description=(
             "Submit demos, review them with staff, and keep artists updated."
         ),
@@ -3547,7 +4438,7 @@ async def help_command(interaction: discord.Interaction):
             "`/my_subs` - view your submissions\n"
             "`/my_stats` - view your acceptance stats\n"
             "`/leaderboard` - see accepted submitters\n"
-            "`/invite` - invite LabelUtils to another server"
+            "`/invite` - invite Vektra to another server"
         ),
         inline=False,
     )
@@ -3557,7 +4448,8 @@ async def help_command(interaction: discord.Interaction):
             "`/queue`, `/recent`, `/panel` - browse submissions\n"
             "`/status` - update a ticket\n"
             "`/start`, `/setup_staff`, `/setup` - setup\n"
-            "`/storage`, `/setup_db` - Pro storage options"
+            "`/storage`, `/setup_db` - Pro storage options\n"
+            "`/make-release`, `/check-releases` - admin release delivery requests"
         ),
         inline=False,
     )
@@ -3574,14 +4466,14 @@ async def help_command(interaction: discord.Interaction):
     )
     embed.add_field(
         name="Docs",
-        value="Full setup guides and command reference: https://labelutils.dapmedia.tech",
+        value="Full setup guides and command reference: https://docs.vektra.games",
         inline=False,
     )
     embed.set_footer(text=f"Premium: {premium_name}")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@tree.command(name="invite", description="Get the LabelUtils invite link")
+@tree.command(name="invite", description="Get the Vektra invite link")
 async def invite_command(interaction: discord.Interaction):
     await interaction.response.send_message(
         f"[Click Me to Invite]({BOT_INVITE_URL})",
@@ -3709,7 +4601,7 @@ def require_starter_admin(interaction: discord.Interaction) -> str | None:
     return None
 
 
-@tree.command(name="start", description="Admin: auto-setup this server with LabelUtils managed storage")
+@tree.command(name="start", description="Admin: auto-setup this server with Vektra managed storage")
 @app_commands.describe(label_name="Display name for this label or server")
 async def start(interaction: discord.Interaction, label_name: str):
     logger.info("Received /start from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
@@ -3741,7 +4633,7 @@ async def start(interaction: discord.Interaction, label_name: str):
         else "managed storage"
     )
     await interaction.followup.send(
-        f"LabelUtils storage is ready for **{truncate_text(label_name, 120)}** using {storage_text}.\n"
+        f"Vektra storage is ready for **{truncate_text(label_name, 120)}** using {storage_text}.\n"
         "Next: run `/setup_staff` to choose the staff channel.",
         ephemeral=True,
     )
@@ -3772,7 +4664,7 @@ async def storage(interaction: discord.Interaction, region: app_commands.Choice[
         pool_slot=region.value,
     )
     await interaction.followup.send(
-        f"Managed storage switched to **{pool_region_name(region.value)}**. Existing LabelUtils data was migrated before switching."
+        f"Managed storage switched to **{pool_region_name(region.value)}**. Existing Vektra data was migrated before switching."
         if assigned
         else f"I could not assign **{pool_region_name(region.value)}**. Check that `POOL_DATABASE_URL_{region.value}` is configured.",
         ephemeral=True,
@@ -3883,7 +4775,7 @@ async def staff_channel_status(interaction: discord.Interaction):
     await interaction.followup.send(text, ephemeral=True)
 
 
-@tree.command(name="setup", description="Admin: check LabelUtils setup for this server")
+@tree.command(name="setup", description="Admin: check Vektra setup for this server")
 async def setup_status(interaction: discord.Interaction):
     logger.info("Received /setup_status from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
     if not user_is_admin(interaction):
@@ -3935,7 +4827,7 @@ async def setup_status(interaction: discord.Interaction):
         "Requires Create Public Threads or Create Private Threads permission in the staff channel."
     )
 
-    embed = discord.Embed(title="LabelUtils Setup Status", color=0x5865F2)
+    embed = discord.Embed(title="Vektra Setup Status", color=0x5865F2)
     embed.add_field(name="Control Database", value=control_status, inline=True)
     embed.add_field(name="Encryption Key", value=encryption_status, inline=True)
     embed.add_field(name="Server Database", value=database_status_text, inline=True)
@@ -3956,12 +4848,12 @@ async def setup_status(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@tree.command(name="premium", description="See how to buy LabelUtils premium")
+@tree.command(name="premium", description="See how to buy Vektra premium")
 async def premium(interaction: discord.Interaction):
     logger.info("Received /premium from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
     await interaction.response.defer(ephemeral=True)
     premium_row = get_premium_guild(interaction.guild_id)
-    embed = discord.Embed(title="LabelUtils Premium", color=0xF1C40F)
+    embed = discord.Embed(title="Vektra Premium", color=0xF1C40F)
     if premium_row:
         plan, expires_at = premium_row
         embed.description = f"This server has the **{premium_plan_label(plan)}** plan until {discord_timestamp(expires_at)}."
@@ -4181,11 +5073,11 @@ class BrandSetupModal(discord.ui.Modal, title="Setup Pro Branding"):
         embed.add_field(name="Display Name", value=truncate_text(self.display_name.value, 80), inline=False)
         embed.add_field(name="Server Nickname", value=nickname_status, inline=False)
         embed.add_field(name="Submit Panel Caption", value=truncate_text(self.caption.value, 180), inline=False)
-        embed.set_footer(text="This branding appears in supported server-specific LabelUtils messages.")
+        embed.set_footer(text="This branding appears in supported server-specific Vektra messages.")
         await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@tree.command(name="brand", description="Starter: customize this server's LabelUtils branding")
+@tree.command(name="brand", description="Starter: customize this server's Vektra branding")
 async def setup_brand(interaction: discord.Interaction):
     logger.info("Received /setup_brand from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
     if not interaction.guild_id:
@@ -4711,7 +5603,7 @@ async def export_submissions(interaction: discord.Interaction):
     data = output.getvalue().encode("utf-8")
     await interaction.followup.send(
         content=f"Exported {len(rows)} submission(s).",
-        file=discord.File(fp=BytesIO(data), filename="labelutils_submissions.csv"),
+        file=discord.File(fp=BytesIO(data), filename="vektra_submissions.csv"),
         ephemeral=True,
     )
 
@@ -5183,6 +6075,31 @@ async def create_submission_thread(
         return None
 
 
+async def create_release_request_thread(
+    staff_message: discord.Message,
+    release_id: str,
+    album_title: str,
+    submitter_id: int,
+) -> discord.Thread | None:
+    try:
+        thread_name = truncate_text(f"{release_id} - {album_title}", 95)
+        thread = await staff_message.create_thread(
+            name=thread_name,
+            auto_archive_duration=1440,
+        )
+        await thread.send(
+            (
+                f"Private QC discussion for release request `{release_id}`.\n"
+                f"Submitter: <@{submitter_id}>\n"
+                "Use this thread for metadata/file checks before sending anything to Labelcaster."
+            )
+        )
+        return thread
+    except Exception:
+        logger.exception("Failed to create release request thread for %s.", release_id)
+        return None
+
+
 @tree.command(name="queue", description="Staff: show the newest queued submissions")
 async def queue(interaction: discord.Interaction):
     if not user_can_manage_submissions(interaction):
@@ -5215,7 +6132,7 @@ async def recent(interaction: discord.Interaction):
 
 @client.event
 async def on_ready():
-    logger.info("LabelUtils Interactive Bot Online: %s", client.user)
+    logger.info("Vektra Interactive Bot Online: %s", client.user)
     logger.info("Default staff channel ID: %s", DEFAULT_STAFF_CHANNEL_ID)
     logger.info("Targeting sync table: label_submissions")
     await sync_all_guild_command_visibility()
@@ -5250,6 +6167,12 @@ def validate_startup_environment() -> bool:
         logger.warning("STAFF_CHANNEL_ID is missing. Servers must run /setup_staff.")
     if OWNER_GUILD_ID == 0:
         logger.warning("OWNER_GUILD_ID is missing. Owner-only commands will not be synced to a private guild.")
+    if RELEASE_CHANNEL_ID == 0:
+        logger.warning("RELEASE_CHANNEL_ID is missing. /make-release cannot post accepted releases for QC.")
+    if not RELEASE_REQ_DATABASE_URL:
+        logger.warning("RELEASE_REQ_DATABASE_URL is missing. /make-release cannot store accepted releases.")
+    if not SAMBANOVA_API_KEY:
+        logger.warning("SAMBANOVA_API_KEY is missing. /make-release metadata checks will reject submissions.")
     return ok
 
 
@@ -5260,7 +6183,7 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
-        body = b"LabelUtils Discord bot is running.\n"
+        body = b"Vektra Discord bot is running.\n"
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -5287,6 +6210,7 @@ if validate_startup_environment():
     if FORCE_IPV4:
         prefer_ipv4_dns()
     ensure_control_tables()
+    ensure_release_request_table()
     start_health_server()
     try:
         client.run(TOKEN)

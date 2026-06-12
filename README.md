@@ -1,20 +1,20 @@
 ---
-title: LabelUtils
+title: Vektra
 colorFrom: indigo
 colorTo: green
 sdk: docker
 app_port: 7860
 ---
 
-# LabelUtils
+# Vektra
 
-LabelUtils is a Discord bot for labels, collectives, and A&R teams that need a clean way to collect demos, review submissions, manage staff notes, and stay in touch with artists.
+Vektra is a Discord bot for labels, collectives, and A&R teams that need a clean way to collect demos, review submissions, manage staff notes, and stay in touch with artists.
 
 ## What It Does
 
 Artists submit demos through a Discord form. Staff receive a private submission card with approve, reject, and DM actions. Each submission can open a private staff discussion thread, so decisions, notes, DMs, and release logs stay attached to the right ticket.
 
-Servers can also use LabelUtils as a private support-ticket tool. Users click a public ticket button, while the actual ticket card appears in a staff-only channel with Resolved and DM buttons.
+Servers can also use Vektra as a private support-ticket tool. Users click a public ticket button, while the actual ticket card appears in a staff-only channel with Resolved and DM buttons.
 
 ## Getting Started
 
@@ -24,7 +24,7 @@ Basic setup takes a few commands:
 2. Run `/setup_staff channel:<staff channel>` to choose where new demo submissions are sent.
 3. Run `/setup` to check that storage, staff channels, branding, and Pro settings are ready.
 
-Free servers are automatically assigned managed storage. Pro servers can later use `/storage` to choose a region or `/setup_db` to connect a custom Neon database. Existing LabelUtils data is migrated when Pro storage is changed.
+Free and Starter servers are automatically assigned managed storage. Pro and Pro+ servers can later use `/storage` to choose a region or `/setup_db` to connect a custom Neon database. Existing Vektra data is migrated when Pro storage is changed.
 
 ## Commands
 
@@ -45,7 +45,7 @@ Free servers are automatically assigned managed storage. Pro servers can later u
 
 ### Server Setup
 
-- `/start label_name:<name>` creates managed LabelUtils storage for the server. This is the normal no-Neon setup for free servers.
+- `/start label_name:<name>` creates managed Vektra storage for the server. This is the normal no-Neon setup for free servers.
 - `/setup_staff channel:<channel>` sets the private staff channel where new submission cards are posted.
 - `/setup` shows the full setup status: storage, premium, branding, staff channel, ticket channel, and thread permissions.
 - `/db_status` checks whether server storage is connected.
@@ -64,12 +64,12 @@ Staff submission cards also include approve, reject, and DM actions. Each submis
 
 DM reply forwarding works when the artist replies directly to the bot's DM message. Attachments are forwarded as Discord attachment links, so files are not downloaded or reuploaded by the bot.
 
-### Pro Branding And Workflow
+### Starter Branding And Workflow
 
-Pro is built for teams that want a fuller A&R workflow:
+Starter is built for labels that want the bot to feel branded without needing the full A&R suite:
 
 - `/brand` opens a form to set the server's display name, required submit panel caption, and embed color.
-- `/brand_info` shows the current Pro branding and premium state.
+- `/brand_info` shows the current premium branding and premium state.
 - `/brand_clear` resets custom branding back to server defaults.
 - `/post_panel` posts a branded public submit button panel.
 - `/form label:<text> placeholder:<text>` customizes the optional submission question.
@@ -79,6 +79,8 @@ Pro is built for teams that want a fuller A&R workflow:
 - `/extras footer_text:<text> logo_url:<url|none> success_message:<text>` customizes staff card footers, thumbnails, and submitter confirmation text.
 
 ### Pro A&R Tools
+
+Pro includes everything in Starter, plus deeper staff workflow tools:
 
 - `/note ticket_id:<id> note:<text>` adds a private staff note to a submission.
 - `/reviewer ticket_id:<id> reviewer:<member>` assigns a reviewer to a submission.
@@ -92,7 +94,9 @@ Pro is built for teams that want a fuller A&R workflow:
 - `/analytics` shows Pro submission analytics.
 - `/export` exports submissions as a CSV file.
 
-When a Pro server changes storage region or connects a custom database, LabelUtils migrates existing submissions, tickets, branding, and Pro settings before switching. Old managed storage is cleaned up after a successful move.
+When a Pro or Pro+ server changes storage region or connects a custom database, Vektra migrates existing submissions, tickets, branding, and Pro settings before switching. Old managed storage is cleaned up after a successful move.
+
+When premium expires, saved paid settings are kept but inactive. Existing branded submit panels and ticket panels can still be visible in Discord, but paid workflows stop opening until the server renews.
 
 ## Support Tickets
 
@@ -114,22 +118,24 @@ Ticket cards are private to staff. The submitter only gets a confirmation and ca
 - `/pro_add guild_id:<id> days:<days> plan:<plan>` lets the bot owner manually grant premium.
 - `/pro_remove guild_id:<id>` lets the bot owner remove premium from a server.
 
-Premium is manually handled by the bot owner, so labels can contact the owner, pay, and receive a redeemable coupon.
+Premium is manually handled by the bot owner, so labels can contact the owner, pay, and receive a redeemable coupon. Supported tiers are Starter, Pro, and Pro+. Pro+ currently has the same bot features as Pro while future white-label hosting is prepared.
 
-## Planned Pro+
+Vektra keeps the slash command list clean by syncing paid commands per server. Free servers see the core commands, Starter servers see Starter commands, and Pro or Pro+ servers see the full workflow tools. Owner maintenance commands are only synced to the private owner server.
 
-Pro+ is planned as a deeper white-label option for labels that want LabelUtils to feel like their own private bot.
+## Pro+
 
-The idea is to let a Pro+ server connect its own Discord bot token, so the bot can use that label's own bot identity instead of the shared LabelUtils identity. This would allow a custom bot name, avatar, online status, profile description, and invite identity for that label.
+Pro+ is coded as its own tier and currently has the same bot features as Pro. It is planned as a deeper white-label option for labels that want Vektra to feel like their own private bot.
 
-Current Pro branding already customizes server-specific messages, embeds, panels, templates, and the bot nickname where Discord permissions allow it. Pro+ would go further by running a separate branded bot connection for the buyer.
+The idea is to let a Pro+ server connect its own Discord bot token, so the bot can use that label's own bot identity instead of the shared Vektra identity. This would allow a custom bot name, avatar, online status, profile description, and invite identity for that label.
 
-This feature is not part of the current Pro plan yet. It requires stronger hosting because every custom bot needs its own Discord gateway connection and more memory. Pro purchases help fund better VPS capacity so Pro+ can be built and supported properly.
+Starter and Pro branding already customize server-specific messages, embeds, panels, templates, and the bot nickname where Discord permissions allow it. A future Pro+ upgrade would go further by running a separate branded bot connection for the buyer.
 
-When Pro+ is added, Discord bot tokens will be treated like passwords. Tokens should be stored securely, never shown in public messages or logs, and removable or replaceable by the server owner at any time.
+White-label bot hosting is not live yet. It requires stronger hosting because every custom bot needs its own Discord gateway connection and more memory. Premium purchases help fund better VPS capacity so Pro+ can be expanded properly.
+
+When white-label Pro+ hosting is added, Discord bot tokens will be treated like passwords. Tokens should be stored securely, never shown in public messages or logs, and removable or replaceable by the server owner at any time.
 
 ## Notes
 
-Discord modals allow up to five text inputs. LabelUtils keeps the five core demo fields and lets Pro servers customize the optional message prompt.
+Discord modals allow up to five text inputs. Vektra keeps the five core demo fields and lets Starter, Pro, and Pro+ servers customize the optional message prompt.
 
-Discord does not allow a bot to have a different avatar or online status per server. LabelUtils branding applies inside server-specific messages and embeds, and `/brand` also tries to update the bot's server nickname when permissions allow it.
+Discord does not allow a bot to have a different avatar or online status per server. Vektra branding applies inside server-specific messages and embeds, and `/brand` also tries to update the bot's server nickname when permissions allow it.
