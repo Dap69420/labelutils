@@ -96,6 +96,9 @@ except ValueError:
 RELEASE_REQ_DATABASE_URL = os.getenv("RELEASE_REQ_DATABASE_URL", "")
 WHITE_LABEL_STATUS_TEXT = os.getenv("WHITE_LABEL_STATUS_TEXT", "").strip()
 WHITE_LABEL_STATUS_TYPE = os.getenv("WHITE_LABEL_STATUS_TYPE", "playing").strip().lower()
+VEKTRA_SITE_URL = os.getenv("VEKTRA_SITE_URL", "vektra.games").removeprefix("https://").removeprefix("http://")
+VEKTRA_DOCS_URL = os.getenv("VEKTRA_DOCS_URL", "docs.vektra.games").removeprefix("https://").removeprefix("http://")
+VEKTRA_SUPPORT_INVITE = os.getenv("VEKTRA_SUPPORT_INVITE", "discord.gg/Hysd3GSQxQ").removeprefix("https://").removeprefix("http://")
 
 COOLDOWN_MINUTES = 30
 DB_TIMEOUT_SECONDS = 8
@@ -105,6 +108,10 @@ try:
     HEALTH_PORT = int(os.getenv("PORT", os.getenv("HEALTH_PORT", "7860")))
 except ValueError:
     HEALTH_PORT = 7860
+try:
+    MAIN_STATUS_ROTATION_SECONDS = max(15, int(os.getenv("MAIN_STATUS_ROTATION_SECONDS", "30")))
+except ValueError:
+    MAIN_STATUS_ROTATION_SECONDS = 30
 SAMBANOVA_API_KEY = os.getenv("SAMBANOVA_API_KEY", "")
 SAMBANOVA_API_URL = os.getenv("SAMBANOVA_API_URL", "https://api.sambanova.ai/v1/chat/completions")
 SAMBANOVA_MODEL = os.getenv("SAMBANOVA_MODEL", "Meta-Llama-3.1-8B-Instruct")
@@ -133,6 +140,7 @@ guild_database_cache: dict[int, StorageContext | None] = {}
 guild_staff_channel_cache: dict[int, int] = {}
 guild_brand_cache: dict[int, dict[str, object] | None] = {}
 guild_pro_settings_cache: dict[int, dict[str, object]] = {}
+main_status_rotation_task: asyncio.Task | None = None
 
 LABEL_STATUSES = [
     "In Queue",
@@ -3072,6 +3080,80 @@ def white_label_activity() -> discord.BaseActivity | None:
     if WHITE_LABEL_STATUS_TYPE in {"competing", "compete"}:
         return discord.Activity(type=discord.ActivityType.competing, name=status_text)
     return discord.Game(name=status_text)
+
+
+def fetch_main_status_stats() -> dict[str, int]:
+    stats = {
+        "configured_servers": 0,
+        "active_premium": 0,
+        "white_label_bots": 0,
+    }
+    if not DATABASE_URL:
+        return stats
+
+    try:
+        with connect_db(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM labelutils_guild_databases;")
+                stats["configured_servers"] = int(cur.fetchone()[0] or 0)
+
+                cur.execute("SELECT COUNT(*) FROM labelutils_premium_guilds WHERE expires_at > NOW();")
+                stats["active_premium"] = int(cur.fetchone()[0] or 0)
+
+                cur.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM vektra_white_label_bots
+                    WHERE enabled = TRUE
+                      AND bot_token_encrypted IS NOT NULL;
+                    """
+                )
+                stats["white_label_bots"] = int(cur.fetchone()[0] or 0)
+    except Exception:
+        logger.exception("Failed to fetch main status rotation stats.")
+    return stats
+
+
+def main_status_activities(stats: dict[str, int]) -> list[discord.BaseActivity]:
+    server_count = len(client.guilds)
+    configured_count = stats.get("configured_servers", 0)
+    premium_count = stats.get("active_premium", 0)
+    white_label_count = stats.get("white_label_bots", 0)
+    items: list[discord.BaseActivity] = [
+        discord.Activity(type=discord.ActivityType.watching, name=f"{server_count} Discord server(s)"),
+        discord.Activity(type=discord.ActivityType.watching, name=f"{configured_count} Vektra workspace(s)"),
+        discord.Activity(type=discord.ActivityType.watching, name=f"{premium_count} premium server(s)"),
+        discord.Activity(type=discord.ActivityType.watching, name=f"{white_label_count} Pro+ bot(s)"),
+        discord.Game(name=VEKTRA_SITE_URL),
+        discord.Activity(type=discord.ActivityType.watching, name=VEKTRA_DOCS_URL),
+        discord.Activity(type=discord.ActivityType.listening, name="new demo submissions"),
+        discord.Activity(type=discord.ActivityType.watching, name=VEKTRA_SUPPORT_INVITE),
+    ]
+    random.shuffle(items)
+    return items
+
+
+async def rotate_main_status() -> None:
+    await client.wait_until_ready()
+    while not client.is_closed() and not WHITE_LABEL_GUILD_ID:
+        stats = await asyncio.to_thread(fetch_main_status_stats)
+        for activity in main_status_activities(stats):
+            if client.is_closed() or WHITE_LABEL_GUILD_ID:
+                return
+            try:
+                await client.change_presence(activity=activity)
+            except Exception:
+                logger.exception("Failed to update main bot status.")
+            await asyncio.sleep(MAIN_STATUS_ROTATION_SECONDS)
+
+
+def ensure_main_status_rotation() -> None:
+    global main_status_rotation_task
+    if WHITE_LABEL_GUILD_ID:
+        return
+    if main_status_rotation_task and not main_status_rotation_task.done():
+        return
+    main_status_rotation_task = asyncio.create_task(rotate_main_status())
 
 
 class VektraClient(discord.Client):
@@ -6187,6 +6269,8 @@ async def on_ready():
     activity = white_label_activity()
     if activity:
         await client.change_presence(activity=activity)
+    else:
+        ensure_main_status_rotation()
     logger.info("Default staff channel ID: %s", DEFAULT_STAFF_CHANNEL_ID)
     logger.info("Targeting sync table: label_submissions")
     await sync_all_guild_command_visibility()
