@@ -6177,6 +6177,13 @@ async def on_ready():
     logger.info("Vektra Interactive Bot Online: %s", client.user)
     if WHITE_LABEL_GUILD_ID:
         logger.info("White-label worker locked to guild: %s", WHITE_LABEL_GUILD_ID)
+        for guild in list(client.guilds):
+            if guild.id != WHITE_LABEL_GUILD_ID:
+                logger.warning("White-label worker is in unexpected guild %s; leaving.", guild.id)
+                try:
+                    await guild.leave()
+                except Exception:
+                    logger.exception("Failed to leave unexpected guild %s.", guild.id)
     activity = white_label_activity()
     if activity:
         await client.change_presence(activity=activity)
