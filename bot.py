@@ -183,8 +183,12 @@ PRO_COMMAND_NAMES = {
     "tickets",
     "ticket_set",
 }
+PRO_PLUS_COMMAND_NAMES = {
+    "white_label",
+    "white_label_status",
+}
 OWNER_COMMAND_NAMES = {"coupon", "pro_add", "pro_remove"}
-TIERED_COMMAND_NAMES = STARTER_COMMAND_NAMES | PRO_COMMAND_NAMES | OWNER_COMMAND_NAMES
+TIERED_COMMAND_NAMES = STARTER_COMMAND_NAMES | PRO_COMMAND_NAMES | PRO_PLUS_COMMAND_NAMES | OWNER_COMMAND_NAMES
 tiered_commands: dict[str, app_commands.Command] = {}
 command_visibility_synced_once = False
 
@@ -1458,7 +1462,7 @@ def user_is_bot_owner(user_id: int) -> bool:
 
 def normalize_premium_plan(plan: object) -> str:
     value = str(plan or "").strip().lower().replace("-", "_").replace(" ", "_")
-    if value in {"starter", "start", "basic", "liAte"}:
+    if value in {"starter", "start", "basic", "lite"}:
         return "starter"
     if value in {"pro_plus", "pro+", "plus", "proplus", "white_label", "whitelabel"}:
         return "pro_plus"
@@ -1509,6 +1513,115 @@ def guild_has_pro(guild_id: int | None) -> bool:
 def guild_has_pro_plus(guild_id: int | None) -> bool:
     row = get_premium_guild(guild_id)
     return bool(row and premium_plan_rank(row[0]) >= PREMIUM_PLAN_RANKS["pro_plus"])
+
+
+def ensure_white_label_table() -> bool:
+    if not DATABASE_URL:
+        logger.warning("DATABASE_URL is missing; cannot prepare white-label table.")
+        return False
+
+    try:
+        with connect_db(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS vektra_white_label_bots (
+                        guild_id BIGINT PRIMARY KEY,
+                        enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                        client_id TEXT,
+                        bot_token_encrypted TEXT,
+                        status_type TEXT NOT NULL DEFAULT 'playing',
+                        status_text TEXT NOT NULL DEFAULT 'reviewing demos',
+                        manager_status TEXT NOT NULL DEFAULT 'pending',
+                        manager_message TEXT NOT NULL DEFAULT '',
+                        last_started_at TIMESTAMPTZ,
+                        last_seen_at TIMESTAMPTZ,
+                        updated_by BIGINT,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                    """
+                )
+        return True
+    except Exception:
+        logger.exception("Failed to prepare white-label bot table.")
+        return False
+
+
+def fetch_white_label_config(guild_id: int | None) -> tuple | None:
+    if not guild_id or not ensure_white_label_table():
+        return None
+
+    try:
+        with connect_db(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        enabled,
+                        client_id,
+                        bot_token_encrypted IS NOT NULL AS configured,
+                        status_type,
+                        status_text,
+                        manager_status,
+                        manager_message,
+                        last_started_at,
+                        last_seen_at,
+                        updated_at
+                    FROM vektra_white_label_bots
+                    WHERE guild_id = %s;
+                    """,
+                    (guild_id,),
+                )
+                return cur.fetchone()
+    except Exception:
+        logger.exception("Failed to fetch white-label bot config for guild %s.", guild_id)
+        return None
+
+
+def upsert_white_label_runtime(
+    guild_id: int | None,
+    updated_by: int,
+    *,
+    enabled: bool,
+    status_type: str | None = None,
+    status_text: str | None = None,
+) -> bool:
+    if not guild_id or not ensure_white_label_table():
+        return False
+
+    safe_status_type = str(status_type or "playing").strip().lower()
+    if safe_status_type not in {"playing", "watching", "listening", "competing"}:
+        safe_status_type = "playing"
+    safe_status_text = truncate_text(status_text or "reviewing demos", 120)
+
+    try:
+        with connect_db(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO vektra_white_label_bots (
+                        guild_id, enabled, status_type, status_text,
+                        manager_status, manager_message, updated_by, updated_at
+                    ) VALUES (
+                        %s, %s, %s, %s,
+                        'pending_restart', 'Waiting for VPS manager to apply changes.', %s, NOW()
+                    )
+                    ON CONFLICT (guild_id)
+                    DO UPDATE SET
+                        enabled = EXCLUDED.enabled,
+                        status_type = EXCLUDED.status_type,
+                        status_text = EXCLUDED.status_text,
+                        manager_status = 'pending_restart',
+                        manager_message = 'Waiting for VPS manager to apply changes.',
+                        updated_by = EXCLUDED.updated_by,
+                        updated_at = NOW();
+                    """,
+                    (guild_id, enabled, safe_status_type, safe_status_text, updated_by),
+                )
+        return True
+    except Exception:
+        logger.exception("Failed to update white-label runtime for guild %s.", guild_id)
+        return False
 
 
 def add_premium_guild(guild_id: int, plan: str, days: int, added_by: int) -> bool:
@@ -3268,6 +3381,8 @@ def tiered_command_names_for_guild(guild_id: int) -> list[str]:
             names.update(STARTER_COMMAND_NAMES)
         if rank >= PREMIUM_PLAN_RANKS["pro"]:
             names.update(PRO_COMMAND_NAMES)
+        if rank >= PREMIUM_PLAN_RANKS["pro_plus"]:
+            names.update(PRO_PLUS_COMMAND_NAMES)
     if OWNER_GUILD_ID and guild_id == OWNER_GUILD_ID:
         names.update(OWNER_COMMAND_NAMES)
     return sorted(names)
@@ -4983,6 +5098,10 @@ async def staff_channel_status(interaction: discord.Interaction):
 async def intake_toggle(interaction: discord.Interaction, open: bool, message: str = ""):
     logger.info("Received /intake from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
     await interaction.response.defer(ephemeral=True)
+    await set_submission_intake(interaction, open=open, message=message)
+
+
+async def set_submission_intake(interaction: discord.Interaction, *, open: bool, message: str = ""):
     if not user_is_admin(interaction):
         await interaction.followup.send("Only administrators can change submission intake.", ephemeral=True)
         return
@@ -5006,6 +5125,21 @@ async def intake_toggle(interaction: discord.Interaction, open: bool, message: s
         f"Demo submissions are now **{state}**." if saved else "I could not save intake settings.",
         ephemeral=True,
     )
+
+
+@tree.command(name="open_submissions", description="Admin: open demo submissions for this server")
+async def open_submissions(interaction: discord.Interaction):
+    logger.info("Received /open_submissions from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    await interaction.response.defer(ephemeral=True)
+    await set_submission_intake(interaction, open=True)
+
+
+@tree.command(name="close_submissions", description="Admin: close demo submissions for this server")
+@app_commands.describe(message="Optional message shown to artists while submissions are closed")
+async def close_submissions(interaction: discord.Interaction, message: str = ""):
+    logger.info("Received /close_submissions from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    await interaction.response.defer(ephemeral=True)
+    await set_submission_intake(interaction, open=False, message=message)
 
 
 @tree.command(name="setup", description="Admin: check Vektra setup for this server")
@@ -5127,6 +5261,97 @@ async def premium_status(interaction: discord.Interaction):
         await reset_inactive_pro_nickname(interaction)
         text = f"This server does not have premium.\n{PREMIUM_CONTACT}"
     await interaction.followup.send(text, ephemeral=True)
+
+
+@tree.command(name="white_label_status", description="Pro+: show hosted white-label bot status")
+async def white_label_status(interaction: discord.Interaction):
+    logger.info("Received /white_label_status from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    await interaction.response.defer(ephemeral=True)
+    if not user_is_admin(interaction):
+        await interaction.followup.send("Only administrators can view Pro+ bot hosting status.", ephemeral=True)
+        return
+    if not guild_has_pro_plus(interaction.guild_id):
+        await interaction.followup.send("White-label bot hosting requires Pro+.", ephemeral=True)
+        return
+
+    row = fetch_white_label_config(interaction.guild_id)
+    embed = discord.Embed(title="Pro+ White-label Bot", color=0x8B5CF6)
+    if not row:
+        embed.description = "No hosted bot configuration has been saved yet. Open the dashboard Pro+ Bot page to add the token and client ID."
+    else:
+        enabled, client_id, configured, status_type, status_text, manager_status, manager_message, last_started_at, last_seen_at, updated_at = row
+        embed.add_field(name="Enabled", value="Yes" if enabled else "No", inline=True)
+        embed.add_field(name="Token", value="Stored" if configured else "Missing", inline=True)
+        embed.add_field(name="Worker", value=str(manager_status or "not configured"), inline=True)
+        embed.add_field(name="Status", value=f"{status_type or 'playing'} {status_text or 'reviewing demos'}", inline=False)
+        embed.add_field(name="Client ID", value=f"`{client_id}`" if client_id else "Not set", inline=False)
+        embed.add_field(name="Last started", value=discord_timestamp(last_started_at) if last_started_at else "Never", inline=True)
+        embed.add_field(name="Last seen", value=discord_timestamp(last_seen_at, "R") if last_seen_at else "Never", inline=True)
+        embed.add_field(name="Updated", value=discord_timestamp(updated_at, "R") if updated_at else "Unknown", inline=True)
+        if manager_message:
+            embed.add_field(name="Manager message", value=truncate_text(manager_message, 300), inline=False)
+        if client_id:
+            invite = (
+                "https://discord.com/oauth2/authorize"
+                f"?client_id={client_id}&permissions=4503926112110592&integration_type=0&scope=bot%20applications.commands"
+            )
+            embed.add_field(name="Invite", value=invite, inline=False)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@tree.command(name="white_label", description="Pro+: enable, pause, or update hosted bot runtime")
+@app_commands.describe(
+    enabled="Whether the hosted bot worker should run",
+    status_type="Discord activity type",
+    status_text="Short status text for the hosted bot",
+)
+@app_commands.choices(
+    status_type=[
+        app_commands.Choice(name="Playing", value="playing"),
+        app_commands.Choice(name="Watching", value="watching"),
+        app_commands.Choice(name="Listening", value="listening"),
+        app_commands.Choice(name="Competing", value="competing"),
+    ],
+)
+async def white_label_runtime(
+    interaction: discord.Interaction,
+    enabled: bool,
+    status_type: app_commands.Choice[str] | None = None,
+    status_text: str | None = None,
+):
+    logger.info("Received /white_label from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    await interaction.response.defer(ephemeral=True)
+    if not user_is_admin(interaction):
+        await interaction.followup.send("Only administrators can manage Pro+ bot hosting.", ephemeral=True)
+        return
+    if not guild_has_pro_plus(interaction.guild_id):
+        await interaction.followup.send("White-label bot hosting requires Pro+.", ephemeral=True)
+        return
+
+    existing = fetch_white_label_config(interaction.guild_id)
+    if enabled and (not existing or not existing[2]):
+        await interaction.followup.send(
+            "Add a bot token on the dashboard Pro+ Bot page before enabling the hosted bot.",
+            ephemeral=True,
+        )
+        return
+
+    current_status_type = existing[3] if existing else "playing"
+    current_status_text = existing[4] if existing else "reviewing demos"
+    saved = upsert_white_label_runtime(
+        interaction.guild_id,
+        interaction.user.id,
+        enabled=enabled,
+        status_type=status_type.value if status_type else current_status_type,
+        status_text=status_text or current_status_text,
+    )
+    if not saved:
+        await interaction.followup.send("I could not update the Pro+ bot settings.", ephemeral=True)
+        return
+    await interaction.followup.send(
+        "Pro+ bot hosting updated. The VPS manager will apply the change shortly.",
+        ephemeral=True,
+    )
 
 
 @tree.command(name="redeem", description="Admin: redeem a premium coupon for this server")
