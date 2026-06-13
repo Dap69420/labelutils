@@ -254,6 +254,14 @@ CREATE TABLE IF NOT EXISTS labelutils_pro_settings (
     rejection_reasons TEXT,
     digest_channel_id BIGINT,
     ticket_channel_id BIGINT,
+    intake_open BOOLEAN NOT NULL DEFAULT TRUE,
+    intake_closed_message TEXT,
+    submit_panel_template TEXT,
+    submit_panel_title TEXT,
+    submit_panel_body TEXT,
+    submit_panel_steps TEXT,
+    submit_panel_tips TEXT,
+    submit_button_label TEXT,
     updated_by BIGINT NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -287,7 +295,10 @@ MIGRATION_TABLES = [
             "rejection_template", "cooldown_minutes", "max_submissions_per_user",
             "duplicate_policy", "approved_channel_id", "rejected_channel_id", "footer_text",
             "logo_url", "success_message", "rejection_reasons", "digest_channel_id",
-            "ticket_channel_id", "updated_by", "updated_at",
+            "ticket_channel_id", "intake_open", "intake_closed_message",
+            "submit_panel_template", "submit_panel_title", "submit_panel_body",
+            "submit_panel_steps", "submit_panel_tips", "submit_button_label",
+            "updated_by", "updated_at",
         ],
     ),
 ]
@@ -1052,7 +1063,15 @@ def ensure_submission_table(database_url: str | StorageContext) -> bool:
                     ALTER TABLE labelutils_pro_settings
                     ADD COLUMN IF NOT EXISTS rejection_reasons TEXT,
                     ADD COLUMN IF NOT EXISTS digest_channel_id BIGINT,
-                    ADD COLUMN IF NOT EXISTS ticket_channel_id BIGINT;
+                    ADD COLUMN IF NOT EXISTS ticket_channel_id BIGINT,
+                    ADD COLUMN IF NOT EXISTS intake_open BOOLEAN NOT NULL DEFAULT TRUE,
+                    ADD COLUMN IF NOT EXISTS intake_closed_message TEXT,
+                    ADD COLUMN IF NOT EXISTS submit_panel_template TEXT,
+                    ADD COLUMN IF NOT EXISTS submit_panel_title TEXT,
+                    ADD COLUMN IF NOT EXISTS submit_panel_body TEXT,
+                    ADD COLUMN IF NOT EXISTS submit_panel_steps TEXT,
+                    ADD COLUMN IF NOT EXISTS submit_panel_tips TEXT,
+                    ADD COLUMN IF NOT EXISTS submit_button_label TEXT;
                     """
                 )
                 cur.execute(
@@ -1914,6 +1933,14 @@ DEFAULT_PRO_SETTINGS: dict[str, object] = {
     "rejection_reasons": "",
     "digest_channel_id": 0,
     "ticket_channel_id": 0,
+    "intake_open": True,
+    "intake_closed_message": "Submissions are currently closed for this server. Please check back later.",
+    "submit_panel_template": "simple",
+    "submit_panel_title": "",
+    "submit_panel_body": "",
+    "submit_panel_steps": "",
+    "submit_panel_tips": "",
+    "submit_button_label": "Submit Demo",
 }
 
 
@@ -1922,6 +1949,8 @@ PRO_SETTINGS_KEYS = [
     "cooldown_minutes", "max_submissions_per_user", "duplicate_policy",
     "approved_channel_id", "rejected_channel_id", "footer_text", "logo_url",
     "success_message", "rejection_reasons", "digest_channel_id", "ticket_channel_id",
+    "intake_open", "intake_closed_message", "submit_panel_template", "submit_panel_title",
+    "submit_panel_body", "submit_panel_steps", "submit_panel_tips", "submit_button_label",
 ]
 
 
@@ -1979,7 +2008,10 @@ def get_pro_settings(guild_id: int | None) -> dict[str, object]:
                         message_label, message_placeholder, approval_template, rejection_template,
                         cooldown_minutes, max_submissions_per_user, duplicate_policy,
                         approved_channel_id, rejected_channel_id, footer_text, logo_url,
-                        success_message, rejection_reasons, digest_channel_id, ticket_channel_id
+                        success_message, rejection_reasons, digest_channel_id, ticket_channel_id,
+                        intake_open, intake_closed_message, submit_panel_template,
+                        submit_panel_title, submit_panel_body, submit_panel_steps,
+                        submit_panel_tips, submit_button_label
                     FROM labelutils_pro_settings
                     WHERE guild_id = %s;
                     """,
@@ -2010,6 +2042,41 @@ def cached_submission_form_settings(guild_id: int | None) -> dict[str, object]:
     return settings
 
 
+def get_intake_settings(guild_id: int | None) -> dict[str, object]:
+    settings = {
+        "intake_open": True,
+        "intake_closed_message": DEFAULT_PRO_SETTINGS["intake_closed_message"],
+    }
+    if not guild_id:
+        return settings
+
+    database_url = get_guild_database_url(guild_id)
+    if not database_url or not ensure_submission_table(database_url):
+        return settings
+
+    try:
+        with connect_db(database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT intake_open, intake_closed_message
+                    FROM labelutils_pro_settings
+                    WHERE guild_id = %s;
+                    """,
+                    (guild_id,),
+                )
+                row = cur.fetchone()
+    except Exception:
+        logger.exception("Failed to fetch intake settings for guild %s.", guild_id)
+        return settings
+
+    if row:
+        settings["intake_open"] = bool(row[0])
+        if row[1]:
+            settings["intake_closed_message"] = str(row[1])
+    return settings
+
+
 def upsert_pro_settings(guild_id: int, updated_by: int, **values: object) -> bool:
     database_url = get_guild_database_url(guild_id)
     if not database_url:
@@ -2023,6 +2090,8 @@ def upsert_pro_settings(guild_id: int, updated_by: int, **values: object) -> boo
         "cooldown_minutes", "max_submissions_per_user", "duplicate_policy",
         "approved_channel_id", "rejected_channel_id", "footer_text", "logo_url",
         "success_message", "rejection_reasons", "digest_channel_id", "ticket_channel_id",
+        "intake_open", "intake_closed_message", "submit_panel_template", "submit_panel_title",
+        "submit_panel_body", "submit_panel_steps", "submit_panel_tips", "submit_button_label",
     }
     updates = {key: value for key, value in values.items() if key in allowed}
     if not updates:
@@ -4132,6 +4201,13 @@ class AdvancedSubmissionModal(discord.ui.Modal, title="New Label Submission"):
                 ephemeral=True,
             )
             return
+        intake = get_intake_settings(interaction.guild_id)
+        if not intake.get("intake_open", True):
+            await interaction.followup.send(
+                str(intake.get("intake_closed_message") or DEFAULT_PRO_SETTINGS["intake_closed_message"]),
+                ephemeral=True,
+            )
+            return
         staff_channel_id = get_guild_staff_channel_id(interaction.guild_id)
         if staff_channel_id == 0:
             await interaction.followup.send(
@@ -4899,6 +4975,39 @@ async def staff_channel_status(interaction: discord.Interaction):
     await interaction.followup.send(text, ephemeral=True)
 
 
+@tree.command(name="intake", description="Admin: open or close demo submissions")
+@app_commands.describe(
+    open="Whether artists can submit demos",
+    message="Optional message shown when submissions are closed",
+)
+async def intake_toggle(interaction: discord.Interaction, open: bool, message: str = ""):
+    logger.info("Received /intake from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
+    await interaction.response.defer(ephemeral=True)
+    if not user_is_admin(interaction):
+        await interaction.followup.send("Only administrators can change submission intake.", ephemeral=True)
+        return
+    if not get_guild_database_url(interaction.guild_id):
+        await interaction.followup.send("Run `/start` before changing intake settings.", ephemeral=True)
+        return
+
+    closed_message = (
+        truncate_text(message, 400)
+        if message.strip()
+        else str(DEFAULT_PRO_SETTINGS["intake_closed_message"])
+    )
+    saved = upsert_pro_settings(
+        interaction.guild_id,
+        interaction.user.id,
+        intake_open=open,
+        intake_closed_message=closed_message,
+    )
+    state = "open" if open else "closed"
+    await interaction.followup.send(
+        f"Demo submissions are now **{state}**." if saved else "I could not save intake settings.",
+        ephemeral=True,
+    )
+
+
 @tree.command(name="setup", description="Admin: check Vektra setup for this server")
 async def setup_status(interaction: discord.Interaction):
     logger.info("Received /setup_status from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
@@ -4927,6 +5036,7 @@ async def setup_status(interaction: discord.Interaction):
     premium = get_premium_guild(interaction.guild_id)
     premium_status = f"{premium_plan_label(premium[0])} until {discord_timestamp(premium[1])}" if premium else "Not active"
     pro_settings = get_pro_settings(interaction.guild_id)
+    intake = get_intake_settings(interaction.guild_id)
     ticket_channel_id = int(pro_settings.get("ticket_channel_id") or 0)
     ticket_channel = client.get_channel(ticket_channel_id) if ticket_channel_id else None
     if not ticket_channel and interaction.guild and ticket_channel_id:
@@ -4956,6 +5066,11 @@ async def setup_status(interaction: discord.Interaction):
     embed.add_field(name="Encryption Key", value=encryption_status, inline=True)
     embed.add_field(name="Server Database", value=database_status_text, inline=True)
     embed.add_field(name="Premium", value=premium_status, inline=True)
+    embed.add_field(
+        name="Demo Intake",
+        value="Open" if intake.get("intake_open", True) else f"Closed\n{truncate_text(str(intake.get('intake_closed_message') or ''), 180)}",
+        inline=False,
+    )
     embed.add_field(name="Branding", value=brand_status, inline=False)
     embed.add_field(name="Staff Channel", value=staff_status, inline=False)
     embed.add_field(
@@ -4987,8 +5102,8 @@ async def premium(interaction: discord.Interaction):
         name="Tiers",
         value=(
             "**Starter**: branding, panels, templates, form text, limits, routing, and extras.\n"
-            "**Pro**: Starter plus storage options, A&R tools, analytics/export, and support tickets.\n"
-            "**Pro+**: currently same features as Pro while white-label hosting is prepared."
+            "**Pro**: Starter plus storage options, A&R tools, analytics/export, support tickets, and the dashboard.\n"
+            "**Pro+**: Pro plus hosted white-label bot identity from the dashboard."
         ),
         inline=False,
     )
@@ -5446,6 +5561,76 @@ async def setup_brand_extras(
     )
 
 
+def submit_panel_button_label(guild_id: int) -> str:
+    settings = get_pro_settings(guild_id)
+    label = str(settings.get("submit_button_label") or "Submit Demo").strip()
+    return truncate_text(label, 80) or "Submit Demo"
+
+
+def build_submit_panel_embed(guild_id: int, interaction: discord.Interaction | None = None) -> discord.Embed:
+    brand = get_guild_brand(guild_id) or {}
+    settings = get_pro_settings(guild_id)
+    if brand.get("display_name"):
+        display_name = str(brand["display_name"])
+    elif interaction:
+        display_name = server_display_name(interaction)
+    else:
+        display_name = "this server"
+
+    if brand.get("embed_color") is not None:
+        color = int(brand["embed_color"])
+    elif interaction:
+        color = server_embed_color(interaction)
+    else:
+        color = 0x5865F2
+
+    template = str(settings.get("submit_panel_template") or "simple").strip().lower()
+    if template == "tutorial":
+        title = str(settings.get("submit_panel_title") or "").strip() or f"{display_name} demo tutorial"
+        body = str(settings.get("submit_panel_body") or "").strip() or "Here's the fast way to submit a demo:"
+        steps = [line.strip() for line in str(settings.get("submit_panel_steps") or "").splitlines() if line.strip()]
+        tips = [line.strip() for line in str(settings.get("submit_panel_tips") or "").splitlines() if line.strip()]
+        parts = [body]
+        if steps:
+            parts.append("")
+            parts.extend(f"{index}. {step}" for index, step in enumerate(steps, start=1))
+        if tips:
+            parts.extend(["", "**Tips**"])
+            parts.extend(f"• {tip}" for tip in tips)
+        embed = discord.Embed(title=truncate_text(title, 256), description="\n".join(parts)[:4096], color=color)
+    else:
+        tagline = str(brand.get("tagline") or "").strip() or "Click the button below to submit your demo."
+        embed = discord.Embed(
+            title=truncate_text(f"Submit to {display_name}", 256),
+            description=truncate_text(tagline, 4096),
+            color=color,
+        )
+
+    footer_text = str(settings.get("footer_text") or "").strip()
+    if footer_text:
+        embed.set_footer(text=truncate_text(footer_text, 2048))
+    logo_url = str(settings.get("logo_url") or "").strip()
+    if logo_url and logo_url.lower() != "none":
+        embed.set_thumbnail(url=truncate_text(logo_url, 512))
+    return embed
+
+
+def build_submit_panel_view(guild_id: int) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    button = discord.ui.Button(
+        label=submit_panel_button_label(guild_id),
+        style=discord.ButtonStyle.blurple,
+        custom_id="submit_panel:open",
+    )
+
+    async def submit_callback(interaction: discord.Interaction):
+        await interaction.response.send_modal(AdvancedSubmissionModal(interaction.guild_id, requires_premium=True))
+
+    button.callback = submit_callback
+    view.add_item(button)
+    return view
+
+
 @tree.command(name="post_panel", description="Starter: post a branded submit button panel")
 async def post_submit_panel(interaction: discord.Interaction):
     logger.info("Received /post_submit_panel from guild=%s user=%s.", interaction.guild_id, interaction.user.id)
@@ -5455,12 +5640,8 @@ async def post_submit_panel(interaction: discord.Interaction):
         await interaction.followup.send(error, ephemeral=True)
         return
 
-    embed = discord.Embed(
-        title=f"Submit to {server_display_name(interaction)}",
-        description=server_tagline(interaction) or "Click the button below to submit your demo.",
-        color=server_embed_color(interaction),
-    )
-    await interaction.followup.send(embed=embed, view=SubmitPanelView())
+    embed = build_submit_panel_embed(interaction.guild_id, interaction)
+    await interaction.followup.send(embed=embed, view=build_submit_panel_view(interaction.guild_id))
 
 
 @tree.command(name="note", description="Pro staff: add a private note to a submission")
